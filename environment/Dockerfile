@@ -12,6 +12,7 @@ RUN conda install -y \
 
 RUN pip install -U --no-cache-dir \
     aind-session \
+    aind-data-schema==1.2.0 \
     h5py \
     matplotlib \
     numpy==1.26.4 \

@@ -2,11 +2,6 @@
 set -e
 
 cd /
-git clone https://github.com/AllenNeuralDynamics/aind-ophys-data-access.git
-cd aind-ophys-data-access
-pip install -e .
-
-cd /
 git clone https://github.com/AllenNeuralDynamics/comb
 cd comb
 pip install -e .
@@ -19,9 +14,14 @@ git clone https://github.com/AllenNeuralDynamics/lamf-analysis
 cd lamf-analysis
 pip install -e .    
 
+# install libraries for opencv-python
+apt-get update
+apt-get install -y libxcb1 libgl1 libglib2.0-0
+
 
 # install updated version of code-server
-VERSION=4.96.4
+# VERSION=4.96.4
+VERSION=4.109.2
 mkdir /.code-server
 cd /.code-server
 curl -fL "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-linux-amd64.tar.gz" \
@@ -71,7 +71,10 @@ else
    # download_and_install_extension github copilot 1.243.0
    # download_and_install_extension MS-vsliveshare vsliveshare 1.0.5900
    # for 4.96.4
-   download_and_install_extension github copilot-chat 0.23.2
-   download_and_install_extension github copilot 1.260.0
+   # download_and_install_extension github copilot-chat 0.23.2
+   # download_and_install_extension github copilot 1.260.0
+  # for 4.109.2
+   download_and_install_extension github copilot-chat 0.37.5
+  #  download_and_install_extension github copilot 1.260.0
 
 fi
