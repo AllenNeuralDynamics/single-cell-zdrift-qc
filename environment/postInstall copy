@@ -36,23 +36,14 @@ cd -
 # run from within a workstation or in postinstall
 # won't work in postinstall if extensions folder has been moved to inside capsule filesystem!
 download_and_install_extension() {
-    publisher="$1"
-    name="$2"
-    version="$3"
-    file="/tmp/${publisher}.${name}.${version}.vsix"
-
-    curl -fL \
-      "https://${publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/${publisher}/extension/${name}/${version}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage" \
-      -o "$file"
-
-    code-server \
-      --disable-telemetry \
-      --extensions-dir=/.vscode/extensions \
-      --install-extension "$file"
+    publisher=$1
+    name=$2
+    version=$3
+    file=/tmp/$publisher.$name.$version.vsix
+    curl -fL http://${publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/${publisher}/extension/${name}/${version}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage \
+        --output $file
+    code-server --disable-telemetry --extensions-dir=/.vscode/extensions --install-extension $file
 }
-
-mkdir -p /.vscode/extensions
-
 
 # # default behavior: extensions are cleared when capsule is rebuilt, can be installed in postInstall
 # # alternative: install extensions manually inside capsule, and save them across rebuilds
@@ -83,8 +74,7 @@ else
    # download_and_install_extension github copilot-chat 0.23.2
    # download_and_install_extension github copilot 1.260.0
   # for 4.109.2
-  code-server --disable-telemetry --extensions-dir=/.vscode/extensions --uninstall-extension GitHub.copilot
-  download_and_install_extension GitHub copilot-chat 0.37.5
+   download_and_install_extension github copilot-chat 0.37.5
   #  download_and_install_extension github copilot 1.260.0
 
 fi
