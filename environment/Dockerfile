@@ -3,33 +3,27 @@ ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG GIT_ASKPASS
-COPY git-askpass /
 
-RUN conda install -y \
-        ipykernel==6.29.5 \
+RUN mamba install -y -c conda-forge \
+    python==3.11 \
+    ipykernel==6.29.5 \
+    hdbscan \
     && conda clean -ya
+
+# install libraries for opencv-python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxcb1 libgl1 libglib2.0-0
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U --no-cache-dir \
     aind-session \
-    aind-data-schema==1.2.0 \
-    h5py \
-    matplotlib \
-    numpy==1.26.4 \
-    pandas \
-    seaborn \
-    codeocean \
-    dask \
-    distributed \
-    tables \
-    pyarrow \
-    ray \
-    ipywidgets \
-    scikit-learn \
     aind-codeocean-utils \
     aind-data-access-api \
     aind-ophys-utils \
-    aind_session
+    aind-data-schema==1.2.0 \
+    numpy==1.26.4 \
+    codeocean==0.14.0 \
+    ipywidgets
 
 COPY postInstall /
 RUN --mount=type=secret,id=secrets . /run/secrets/secrets \
