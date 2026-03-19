@@ -328,9 +328,9 @@ def make_qc_gif_frames(
 
     # Three contrast presets: (lo_pct, hi_pct, label)
     contrast_presets = [
-        (0.2, 98.0, "lower (p0.2-p98)"),
+        (0.1, 98.0, "lower (p0.1-p98)"),
         (1.0, 99.5, "medium (p1-p99.5)"),
-        (2.0, 99.99, "higher (p2-p99.99)"),
+        (3.0, 99.99, "higher (p3-p99.99)"),
     ]
     stacks_u8 = []
     for lo_pct, hi_pct, _ in contrast_presets:
@@ -376,7 +376,7 @@ def make_qc_gif_frames(
     title_banner_h = title_h - title_top_off + 2 * PAD
 
     # Column header: measure the longest possible label
-    sample_col_text = f"higher (p2-p99.99)  |  z=000"
+    sample_col_text = f"higher (p10-p99.99)  |  z=000"
     _, col_h = _text_size(_tmp_d, sample_col_text, font_col)
     col_top_off = _text_draw_top(_tmp_d, sample_col_text, font_col)
     col_banner_h = col_h - col_top_off + 2 * PAD
