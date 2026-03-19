@@ -1,9 +1,0 @@
-{
-	"version": 1,
-	"attached_datasets": [
-		{
-			"id": "cd258fae-7af4-4966-852d-d27076c4f92e",
-			"mount": "test_dataset_for_qc_aggregator"
-		}
-	]
-}

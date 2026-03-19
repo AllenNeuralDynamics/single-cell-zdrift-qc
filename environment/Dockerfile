@@ -3,6 +3,8 @@ ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG GIT_ASKPASS
+COPY git-ask-pass /
 
 RUN mamba install -y -c conda-forge \
     python==3.11 \

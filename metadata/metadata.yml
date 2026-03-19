@@ -1,5 +1,5 @@
 metadata_version: 1
-name: Jinho_base - VSCode python 3.11 CO4.3 (260309)
+name: Single cell z-drift QC
 description: |-
   Base env setting for using VSCode in CodeOcean
   - including minimal settings for most of the analysis
