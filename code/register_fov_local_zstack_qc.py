@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
+from PIL import Image, ImageDraw, ImageFont
 from skimage import measure
 
 from lamf_analysis.code_ocean import capsule_data_utils as cdu
@@ -27,7 +28,7 @@ from lamf_analysis.ophys import roi_utils
 # z-drift matched index helpers
 # ---------------------------------------------------------------------------
 
-def get_5min_zdrift_minmax(result: dict[str, Any], window_size: int = 5) -> tuple[int, int]:
+def get_binned_zdrift_minmax(result: dict[str, Any], window_size: int = 5) -> tuple[int, int]:
     """Return the (min, max) smoothed z-drift plane indices over a rolling window.
 
     Uses a median rolling window of ``window_size`` frames (approx. 5 min at
@@ -43,28 +44,28 @@ def get_5min_zdrift_minmax(result: dict[str, Any], window_size: int = 5) -> tupl
     return int(filtered.min()), int(filtered.max())
 
 
-def get_zdrift_matched_inds(result: dict[str, Any]) -> tuple[int, int]:
+def get_zdrift_matched_inds(result: dict[str, Any], zdrift_calc_bin: int = 5) -> tuple[int, int]:
     """Return (start, end) indices into the padded registered z-stack
     corresponding to the smoothed z-drift min/max.
 
     These index into ``result['registered_zstack']`` (the padded stack).
     """
     padded_indices = result["padded_plane_indices"]
-    z_min, z_max = get_5min_zdrift_minmax(result)
+    z_min, z_max = get_binned_zdrift_minmax(result, window_size=zdrift_calc_bin)
     start = int(np.where(padded_indices == z_min)[0][0])
     end = int(np.where(padded_indices == z_max)[0][0])
     return start, end
 
 
-def get_matched_registered_zstack(result: dict[str, Any]) -> np.ndarray:
+def get_matched_registered_zstack(result: dict[str, Any], zdrift_calc_bin: int = 5) -> np.ndarray:
     """Return the slice of the registered z-stack spanning the z-drift matched range."""
-    start, end = get_zdrift_matched_inds(result)
+    start, end = get_zdrift_matched_inds(result, zdrift_calc_bin)
     return result["registered_zstack"][start : end + 1]
 
 
-def get_mean_registered_zstack(result: dict[str, Any]) -> np.ndarray:
+def get_mean_registered_zstack(result: dict[str, Any], zdrift_calc_bin: int = 5) -> np.ndarray:
     """Return the mean image over the z-drift matched planes."""
-    matched = get_matched_registered_zstack(result)
+    matched = get_matched_registered_zstack(result, zdrift_calc_bin)
     return np.mean(matched, axis=0)
 
 
@@ -90,7 +91,8 @@ def calculate_neuropil_intensity(row: pd.Series, zstack_mean: np.ndarray) -> flo
     return float((zstack_mean * mask).sum() / mask.sum())
 
 
-def get_valid_roi_table(result: dict[str, Any]) -> pd.DataFrame:
+def get_valid_roi_table(result: dict[str, Any],
+                        zdrift_calc_bin: int = 5) -> pd.DataFrame:
     """Build a valid-ROI table annotated with z-dependent intensity metrics.
 
     Adds columns:
@@ -103,8 +105,8 @@ def get_valid_roi_table(result: dict[str, Any]) -> pd.DataFrame:
     - ``intensity_top_bottom_ratio``: top/bottom ratio (≤1, negative for inverted)
     """
     reg_zstack = result["registered_zstack"]
-    mean_zstack = get_mean_registered_zstack(result)
-    start_ind, end_ind = get_zdrift_matched_inds(result)
+    mean_zstack = get_mean_registered_zstack(result, zdrift_calc_bin)
+    start_ind, end_ind = get_zdrift_matched_inds(result, zdrift_calc_bin)
 
     plane_path = result.get("plane_path", "")
     roi_table = cdu.get_roi_table_from_plane_path(plane_path)
@@ -179,6 +181,7 @@ def make_roi_overlay_image(
     result: dict[str, Any],
     valid_roi_table: pd.DataFrame,
     *,
+    zdrift_calc_bin: int = 5,
     roi_color: tuple[int, int, int] = (255, 0, 0),
     neuropil_color: tuple[int, int, int] = (255, 255, 0),
     show_neuropil: bool = True,
@@ -199,13 +202,13 @@ def make_roi_overlay_image(
     -------
     np.ndarray  (H, W, 3)  uint8
     """
-    mean_img = get_mean_registered_zstack(result)
+    mean_img = get_mean_registered_zstack(result, zdrift_calc_bin)
 
     valid_px = mean_img[mean_img > 1]
     if valid_px.size == 0:
         valid_px = mean_img.ravel()
     lo = float(np.percentile(valid_px, 1))
-    hi = float(np.percentile(valid_px, 99))
+    hi = float(np.percentile(valid_px, 99.5))
     norm = ((mean_img - lo) / max(hi - lo, 1e-6) * 255).clip(0, 255).astype(np.uint8)
     rgb = np.stack([norm, norm, norm], axis=-1)
 
@@ -232,10 +235,12 @@ def save_roi_overlay_image(
     result: dict[str, Any],
     valid_roi_table: pd.DataFrame,
     save_path: Path | str,
+    *,
+    zdrift_calc_bin: int = 5,
     **kwargs: Any,
 ) -> Path:
     """Save the ROI overlay image as a PNG. Returns the save path."""
-    rgb = make_roi_overlay_image(result, valid_roi_table, **kwargs)
+    rgb = make_roi_overlay_image(result, valid_roi_table, zdrift_calc_bin=zdrift_calc_bin, **kwargs)
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(str(save_path), rgb)
@@ -246,32 +251,137 @@ def save_roi_overlay_image(
 # QC GIF: animated registered z-stack matched range with ROI outlines
 # ---------------------------------------------------------------------------
 
+def _pil_font(size: int = 12) -> ImageFont.ImageFont:
+    """Load a PIL font at the requested size, with robust fallbacks."""
+    import glob as _glob
+    # Candidate filenames in priority order
+    candidates = [
+        "DejaVuSansMono.ttf",
+        "DejaVuSans.ttf",
+        "LiberationMono-Regular.ttf",
+        "FreeMono.ttf",
+    ]
+    # Build search dirs: system dirs + matplotlib bundled fonts
+    search_dirs = ["/usr/share/fonts", "/usr/local/share/fonts"]
+    try:
+        import matplotlib
+        mpl_font_dir = str(Path(matplotlib.get_data_path()) / "fonts" / "ttf")
+        search_dirs.insert(0, mpl_font_dir)
+    except Exception:
+        pass
+
+    for name in candidates:
+        # Try PIL's own font lookup first (works if font is on system PATH)
+        try:
+            return ImageFont.truetype(name, size)
+        except (IOError, OSError):
+            pass
+        # Try explicit paths in known dirs
+        for d in search_dirs:
+            full = str(Path(d) / name)
+            try:
+                return ImageFont.truetype(full, size)
+            except (IOError, OSError):
+                pass
+        # Try recursive glob under each search dir
+        for d in search_dirs:
+            for hit in _glob.glob(f"{d}/**/{name}", recursive=True):
+                try:
+                    return ImageFont.truetype(hit, size)
+                except (IOError, OSError):
+                    pass
+
+    # Final fallback: Pillow ≥ 10 supports size parameter
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def make_qc_gif_frames(
     result: dict[str, Any],
     valid_roi_table: pd.DataFrame,
     *,
+    zdrift_calc_bin: int = 5,
     intensity_threshold: float = 0.5,
     roi_color_pass: tuple[int, int, int] = (255, 0, 0),
     roi_color_negative: tuple[int, int, int] = (0, 255, 255),
     roi_color_fail: tuple[int, int, int] = (255, 255, 0),
+    font_size: int = 28,
 ) -> list[np.ndarray]:
     """Build per-frame RGB images for the QC GIF.
 
-    Each frame corresponds to a z-plane in the matched registered z-stack range,
-    with colour-coded ROI contours overlaid.
+    Layout (top to bottom):
+    1. Title header  – session key | plane ID | drift planes (centred, white)
+    2. Column headers – one per panel: preset label + z=XX (yellow)
+    3. Image panels   – three side-by-side contrast normalisations
 
     Returns
     -------
-    list of np.ndarray  (H, W, 3)  uint8
+    list of np.ndarray  (H_total, W_total, 3)  uint8
     """
-    reg_zstack_matched = get_matched_registered_zstack(result)
+    reg_zstack_matched = get_matched_registered_zstack(result, zdrift_calc_bin)
 
     valid_px = reg_zstack_matched[reg_zstack_matched > 1]
     if valid_px.size == 0:
         valid_px = reg_zstack_matched.ravel()
-    lo = float(np.percentile(valid_px, 1))
-    hi = float(np.percentile(valid_px, 99))
-    stack_u8 = ((reg_zstack_matched - lo) / max(hi - lo, 1e-6) * 255).clip(0, 255).astype(np.uint8)
+
+    # Three contrast presets: (lo_pct, hi_pct, label)
+    contrast_presets = [
+        (0.2, 98.0, "lower (p0.2-p98)"),
+        (1.0, 99.5, "medium (p1-p99.5)"),
+        (2.0, 99.99, "higher (p2-p99.99)"),
+    ]
+    stacks_u8 = []
+    for lo_pct, hi_pct, _ in contrast_presets:
+        lo = float(np.percentile(valid_px, lo_pct))
+        hi = float(np.percentile(valid_px, hi_pct))
+        s = ((reg_zstack_matched - lo) / max(hi - lo, 1e-6) * 255).clip(0, 255).astype(np.uint8)
+        stacks_u8.append(s)
+
+    # Metadata
+    session_key = result.get("session_key", "NA")
+    plane_id = result.get("plane_id", "NA")
+    start_ind, end_ind = get_zdrift_matched_inds(result, zdrift_calc_bin)
+    total_drift_planes = end_ind - start_ind + 1
+    padded_indices = np.asarray(result.get("padded_plane_indices", []))
+
+    title_line = f"{session_key}  |  {plane_id}  |  drift planes: {total_drift_planes}"
+    font_title = _pil_font(font_size)
+    font_col = _pil_font(max(font_size - 2, 16))   # column header font
+
+    def _text_size(draw: ImageDraw.Draw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
+        try:
+            bb = draw.textbbox((0, 0), text, font=font)
+            return bb[2] - bb[0], bb[3] - bb[1]
+        except AttributeError:
+            return draw.textsize(text, font=font)
+
+    def _text_draw_top(draw: ImageDraw.Draw, text: str, font: ImageFont.ImageFont) -> int:
+        """Return the actual top pixel offset when drawing at y=0 (can be negative)."""
+        try:
+            bb = draw.textbbox((0, 0), text, font=font)
+            return bb[1]  # top offset (<=0 typically)
+        except AttributeError:
+            return 0
+
+    PAD = max(font_size // 3, 8)  # vertical padding on each side of a text row
+
+    # Measure true rendered heights using a dummy image
+    _tmp_img = Image.new("RGB", (10, 10))
+    _tmp_d = ImageDraw.Draw(_tmp_img)
+    _, title_h = _text_size(_tmp_d, title_line, font_title)
+    title_top_off = _text_draw_top(_tmp_d, title_line, font_title)
+    # Banner heights: text height + top-offset correction + 2× padding
+    title_banner_h = title_h - title_top_off + 2 * PAD
+
+    # Column header: measure the longest possible label
+    sample_col_text = f"higher (p2-p99.99)  |  z=000"
+    _, col_h = _text_size(_tmp_d, sample_col_text, font_col)
+    col_top_off = _text_draw_top(_tmp_d, sample_col_text, font_col)
+    col_banner_h = col_h - col_top_off + 2 * PAD
+
+    panel_w = stacks_u8[0].shape[2]  # width of one panel
 
     # Pre-compute binary masks and colours once
     roi_masks = []
@@ -289,15 +399,55 @@ def make_qc_gif_frames(
         roi_colors.append(color)
 
     frames: list[np.ndarray] = []
-    for z_img in stack_u8:
-        rgb = np.stack([z_img, z_img, z_img], axis=-1)
-        for mask, color in zip(roi_masks, roi_colors):
-            for contour in measure.find_contours(mask, 0.5):
-                c = contour.astype(int)
-                for r, col in zip(c[:, 0], c[:, 1]):
-                    if 0 <= r < rgb.shape[0] and 0 <= col < rgb.shape[1]:
-                        rgb[r, col] = color
-        frames.append(rgb.astype(np.uint8))
+    for frame_i in range(len(stacks_u8[0])):
+        # z value for this frame
+        if padded_indices.size > 0:
+            z_global = int(padded_indices[start_ind + frame_i])
+        else:
+            z_global = start_ind + frame_i
+        z_label = f"z={z_global}"
+
+        # Build each image panel
+        panels = []
+        for stack_idx in range(len(contrast_presets)):
+            z_img = stacks_u8[stack_idx][frame_i]
+            rgb = np.stack([z_img, z_img, z_img], axis=-1)
+            for mask, color in zip(roi_masks, roi_colors):
+                for contour in measure.find_contours(mask, 0.5):
+                    c = contour.astype(int)
+                    for r, col_i in zip(c[:, 0], c[:, 1]):
+                        if 0 <= r < rgb.shape[0] and 0 <= col_i < rgb.shape[1]:
+                            rgb[r, col_i] = color
+            panels.append(rgb)
+
+        # Concatenate panels side by side
+        combined = np.concatenate(panels, axis=1)  # (H, W*3, 3)
+        img_h, W_total = combined.shape[:2]
+
+        # Full canvas: title banner + column-header banner + image panels
+        total_h = title_banner_h + col_banner_h + img_h
+        canvas = np.zeros((total_h, W_total, 3), dtype=np.uint8)
+        canvas[title_banner_h + col_banner_h:] = combined
+
+        pil_canvas = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(pil_canvas)
+
+        # ── Title banner (centred) ──────────────────────────────────────────
+        t_w, _ = _text_size(draw, title_line, font_title)
+        title_y = PAD - title_top_off  # compensate for font's top offset
+        draw.text(((W_total - t_w) // 2, title_y), title_line,
+                  fill=(255, 255, 255), font=font_title)
+
+        # ── Column headers (one per panel) ─────────────────────────────────
+        col_y = title_banner_h + PAD - col_top_off  # starts after title banner
+        for col_idx, (_, _, preset_label) in enumerate(contrast_presets):
+            col_text = f"{preset_label}  |  {z_label}"
+            col_x_center = col_idx * panel_w + panel_w // 2
+            cw, _ = _text_size(draw, col_text, font_col)
+            draw.text((col_x_center - cw // 2, col_y), col_text,
+                      fill=(255, 255, 0), font=font_col)
+
+        frames.append(np.asarray(pil_canvas, dtype=np.uint8))
 
     return frames
 
@@ -345,6 +495,7 @@ def run_qc(
     *,
     gif_fps: int = 3,
     intensity_threshold: float = 0.5,
+    zdrift_calc_bin: int = 5,
 ) -> dict[str, Any]:
     """Run the full QC pipeline for one registration result.
 
@@ -360,6 +511,8 @@ def run_qc(
         GIF frames per second. Default 3.
     intensity_threshold : float
         Pass/fail threshold for ``intensity_top_bottom_ratio``. Default 0.5.
+    zdrift_calc_bin : int
+        Bin size (in minutes) for calculating z-drift min/max. Default 5.
 
     Returns
     -------
@@ -372,7 +525,7 @@ def run_qc(
     plane_id = result.get("plane_id", "NA")
     save_dir = Path(save_dir)
 
-    valid_roi_table = get_valid_roi_table(result)
+    valid_roi_table = get_valid_roi_table(result, zdrift_calc_bin=zdrift_calc_bin)
     valid_roi_table["negative_intensity"] = valid_roi_table["intensity_top_bottom_ratio"] < -1
     valid_roi_table["drift_pass"] = valid_roi_table["intensity_top_bottom_ratio"] >= intensity_threshold
     valid_roi_table["binary_mask_matrix"] = valid_roi_table["mask_matrix"].apply(
@@ -380,10 +533,10 @@ def run_qc(
     )
 
     overlay_path = save_dir / f"{session_key}_{plane_id}_registered_mean_zstack_roi_overlay.png"
-    save_roi_overlay_image(result, valid_roi_table, overlay_path)
+    save_roi_overlay_image(result, valid_roi_table, overlay_path, zdrift_calc_bin=zdrift_calc_bin)
 
     gif_path = save_dir / f"{session_key}_{plane_id}_registered_zstack_with_roi_outlines.gif"
-    save_qc_gif(result, valid_roi_table, gif_path, fps=gif_fps, intensity_threshold=intensity_threshold)
+    save_qc_gif(result, valid_roi_table, gif_path, fps=gif_fps, intensity_threshold=intensity_threshold, zdrift_calc_bin=zdrift_calc_bin)
 
     return {
         "valid_roi_table": valid_roi_table,

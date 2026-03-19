@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U --no-cache-dir \
+    suite2p \
     aind-session \
     aind-codeocean-utils \
     aind-data-access-api \
@@ -26,6 +27,7 @@ RUN pip install -U --no-cache-dir \
     numpy==1.26.4 \
     codeocean==0.14.0 \
     ipywidgets
+    
 
 COPY postInstall /
 RUN --mount=type=secret,id=secrets . /run/secrets/secrets \

@@ -31,7 +31,7 @@ from lamf_analysis.ophys import zstack as zstack_mod
 import lamf_analysis.utils as lamf_utils
 
 # Method-level registration logic in sibling methods module.
-_methods_mod_name = "register_fov_local_zstack_single_plane_methods"
+_methods_mod_name = "register_fov_local_zstack_methods"
 try:
     _methods_mod = importlib.import_module(_methods_mod_name)
 except ModuleNotFoundError:
@@ -99,7 +99,7 @@ def prepare_local_zstack(
     *,
     reg_ref_ind: int = 0,
     save_tiff: bool = True,
-    tiff_save_dir: Path | str | None = None,
+    output_dir: Path | str | None = None,
 ) -> np.ndarray:
     """Load and inter-plane-register the local z-stack for a single plane.
 
@@ -116,9 +116,8 @@ def prepare_local_zstack(
         Reference plane index for inter-plane registration. Default 0.
     save_tiff : bool
         Write the registered stack as a TIFF. Default True.
-    tiff_save_dir : Path, str, or None
-        Where to save the TIFF. Defaults to ``plane_path``. Must be writable
-        when ``plane_path`` is on a read-only filesystem.
+    output_dir : Path, str, or None
+        Where to save the TIFF. Must be writable. If None, TIFF is not saved.
 
     Returns
     -------
@@ -140,8 +139,8 @@ def prepare_local_zstack(
     reg_stack, _shifts = zstack_mod.reg_between_planes(raw_stack, ref_ind=reg_ref_ind)
     reg_stack = reg_stack.astype(np.float32)
 
-    if save_tiff:
-        tiff_dir = Path(tiff_save_dir) if tiff_save_dir is not None else plane_path
+    if save_tiff and output_dir is not None:
+        tiff_dir = Path(output_dir)
         tiff_dir.mkdir(parents=True, exist_ok=True)
         tiff_path = tiff_dir / f"{plane_path.name}_local_zstack_registered.tif"
         tifffile.imwrite(str(tiff_path), reg_stack)
@@ -251,8 +250,7 @@ def register_local_zstack_to_fov(
     zstack_data: np.ndarray | None = None,
     reg_ref_ind: int = 0,
     save_tiff: bool = True,
-    tiff_save_dir: Path | str | None = None,
-    affine_use_clahe: bool = False,
+    output_dir: Path | str | None = None,
     nonrigid_block_sizes: tuple[tuple[int, int], ...] = ((32, 32), (64, 64), (128, 128)),
     nonrigid_maxregshift_values: tuple[int, ...] = (3, 5),
     pad: int = 3,
@@ -270,10 +268,8 @@ def register_local_zstack_to_fov(
         Reference plane for inter-plane z-stack registration. Default 0.
     save_tiff : bool
         Save intermediate registered z-stack TIFF. Default True.
-    tiff_save_dir : Path, str, or None
-        TIFF save directory (defaults to ``plane_path``).
-    affine_use_clahe : bool
-        Apply CLAHE in affine search. Default False.
+    output_dir : Path, str, or None
+        Output directory for TIFF files. Required if save_tiff=True.
     nonrigid_block_sizes : tuple of (H, W)
         Block sizes for nonrigid candidate search.
     nonrigid_maxregshift_values : tuple of int
@@ -305,7 +301,7 @@ def register_local_zstack_to_fov(
             plane_path,
             reg_ref_ind=reg_ref_ind,
             save_tiff=save_tiff,
-            tiff_save_dir=tiff_save_dir,
+            output_dir=output_dir,
         )
 
     data = prepare_plane_data(plane_path, zstack_data)
@@ -344,13 +340,16 @@ def register_local_zstack_to_fov(
         "transform": t_info,
     }
 
-    # Stage B: affine search
+    # Stage B: affine search (test CLAHE=False/True and select best affine)
     row_keep, col_keep = _compute_blank_safe_crop_inds(reg_t_crop)
+    affine_results: dict[str, dict[str, Any]] = {}
+    
     if len(row_keep) > 30 and len(col_keep) > 30:
         fov_phase2 = mean_img_cropped[row_keep[:, None], col_keep]
         mov_phase2 = mean_t[row_keep[:, None], col_keep]
         reg_input = reg_t[:, yind[row_keep][:, None], xind[col_keep]]
         valid_mask_aff_local = valid_mask_t[row_keep[:, None], col_keep]
+        
         aff_search = _search_best_affine(
             reg_input=reg_input,
             fov_ref=fov_phase2,
@@ -358,28 +357,58 @@ def register_local_zstack_to_fov(
             valid_mask=valid_mask_aff_local,
         )
         if aff_search is None:
-            reg_a_crop_local, a_info = _register_affine(
-                reg_input, fov_phase2, mov_phase2, use_clahe=affine_use_clahe
-            )
-            a_info = dict(a_info)
-            a_info["affine_normalize"] = True
-            a_info["affine_use_clahe"] = bool(affine_use_clahe)
-            valid_mask_a_local = valid_mask_aff_local
+            # Fallback path: explicit two-variant testing if search fails
+            for use_clahe in (False, True):
+                reg_a_crop_local, a_info = _register_affine(
+                    reg_input, fov_phase2, mov_phase2, use_clahe=use_clahe
+                )
+                a_info = dict(a_info)
+                a_info["affine_use_clahe"] = bool(use_clahe)
+                valid_mask_a_local = valid_mask_aff_local
+
+                reg_a = reg_t.copy().astype(np.float32)
+                reg_a[:, yind[row_keep][:, None], xind[col_keep]] = reg_a_crop_local
+                reg_a_crop = reg_a[:, yind[:, None], xind]
+                valid_mask_a = valid_mask_t.copy()
+                valid_mask_a[row_keep[:, None], col_keep] = valid_mask_a_local
+
+                mean_a = reg_a_crop.mean(axis=0)
+                metrics_a = _compute_registration_metrics(mean_img_cropped, mean_a, valid_mask=valid_mask_a)
+                key = "affine_clahe_true" if use_clahe else "affine_clahe_false"
+                affine_results[key] = {
+                    "registered_zstack": reg_a,
+                    "registered_mean_cropped": mean_a,
+                    "valid_mask": valid_mask_a,
+                    "metrics": metrics_a,
+                    "transform": a_info,
+                }
         else:
-            best_aff, all_affine = aff_search
+            _best_aff, all_affine = aff_search
             for cand in all_affine:
                 tr = dict(cand["transform"])
                 tr["candidate_protocol"] = "affine_after_translation"
                 affine_candidates.append({"metrics": cand["metrics"], "transform": tr})
-            reg_a_crop_local = best_aff["registered_stack"]
-            a_info = best_aff["transform"]
-            valid_mask_a_local = np.asarray(best_aff.get("valid_mask", valid_mask_aff_local), dtype=bool)
 
-        reg_a = reg_t.copy().astype(np.float32)
-        reg_a[:, yind[row_keep][:, None], xind[col_keep]] = reg_a_crop_local
-        reg_a_crop = reg_a[:, yind[:, None], xind]
-        valid_mask_a = valid_mask_t.copy()
-        valid_mask_a[row_keep[:, None], col_keep] = valid_mask_a_local
+                use_clahe = bool(tr.get("candidate_use_clahe", tr.get("affine_use_clahe", False)))
+                key = "affine_clahe_true" if use_clahe else "affine_clahe_false"
+
+                reg_a = reg_t.copy().astype(np.float32)
+                reg_a[:, yind[row_keep][:, None], xind[col_keep]] = cand["registered_stack"]
+                reg_a_crop = reg_a[:, yind[:, None], xind]
+
+                valid_mask_a_local = np.asarray(cand.get("valid_mask", valid_mask_aff_local), dtype=bool)
+                valid_mask_a = valid_mask_t.copy()
+                valid_mask_a[row_keep[:, None], col_keep] = valid_mask_a_local
+
+                mean_a = reg_a_crop.mean(axis=0)
+                metrics_a = _compute_registration_metrics(mean_img_cropped, mean_a, valid_mask=valid_mask_a)
+                affine_results[key] = {
+                    "registered_zstack": reg_a,
+                    "registered_mean_cropped": mean_a,
+                    "valid_mask": valid_mask_a,
+                    "metrics": metrics_a,
+                    "transform": tr,
+                }
     else:
         aff_search = _search_best_affine(
             reg_input=reg_t,
@@ -388,55 +417,102 @@ def register_local_zstack_to_fov(
             valid_mask=valid_mask_t,
         )
         if aff_search is None:
-            reg_a, a_info = _register_affine(
-                reg_t, mean_img_cropped, mean_t, use_clahe=affine_use_clahe
-            )
-            a_info = dict(a_info)
-            a_info["affine_normalize"] = True
-            a_info["affine_use_clahe"] = bool(affine_use_clahe)
-            valid_mask_a = valid_mask_t
+            for use_clahe in (False, True):
+                reg_a, a_info = _register_affine(
+                    reg_t, mean_img_cropped, mean_t, use_clahe=use_clahe
+                )
+                a_info = dict(a_info)
+                a_info["affine_use_clahe"] = bool(use_clahe)
+                valid_mask_a = valid_mask_t
+                reg_a_crop = reg_a[:, yind[:, None], xind]
+
+                mean_a = reg_a_crop.mean(axis=0)
+                metrics_a = _compute_registration_metrics(mean_img_cropped, mean_a, valid_mask=valid_mask_a)
+                key = "affine_clahe_true" if use_clahe else "affine_clahe_false"
+                affine_results[key] = {
+                    "registered_zstack": reg_a,
+                    "registered_mean_cropped": mean_a,
+                    "valid_mask": valid_mask_a,
+                    "metrics": metrics_a,
+                    "transform": a_info,
+                }
         else:
-            best_aff, all_affine = aff_search
+            _best_aff, all_affine = aff_search
             for cand in all_affine:
                 tr = dict(cand["transform"])
                 tr["candidate_protocol"] = "affine_after_translation"
                 affine_candidates.append({"metrics": cand["metrics"], "transform": tr})
-            reg_a = best_aff["registered_stack"]
-            a_info = best_aff["transform"]
-            valid_mask_a = np.asarray(best_aff.get("valid_mask", valid_mask_t), dtype=bool)
-        reg_a_crop = reg_a[:, yind[:, None], xind]
 
-    mean_a = reg_a_crop.mean(axis=0)
-    metrics_a = _compute_registration_metrics(mean_img_cropped, mean_a, valid_mask=valid_mask_a)
-    methods["affine_after_translation"] = {
-        "registered_zstack": reg_a,
-        "registered_mean_cropped": mean_a,
-        "valid_mask": valid_mask_a,
-        "metrics": metrics_a,
-        "transform": a_info,
-    }
+                use_clahe = bool(tr.get("candidate_use_clahe", tr.get("affine_use_clahe", False)))
+                key = "affine_clahe_true" if use_clahe else "affine_clahe_false"
+                reg_a = cand["registered_stack"]
+                valid_mask_a = np.asarray(cand.get("valid_mask", valid_mask_t), dtype=bool)
+                reg_a_crop = reg_a[:, yind[:, None], xind]
 
-    # Stage C: nonrigid search from affine output
+                mean_a = reg_a_crop.mean(axis=0)
+                metrics_a = _compute_registration_metrics(mean_img_cropped, mean_a, valid_mask=valid_mask_a)
+                affine_results[key] = {
+                    "registered_zstack": reg_a,
+                    "registered_mean_cropped": mean_a,
+                    "valid_mask": valid_mask_a,
+                    "metrics": metrics_a,
+                    "transform": tr,
+                }
+    
+    # Select best affine variant (and add both to candidates)
+    best_affine_name, best_affine_data = min(
+        affine_results.items(), key=lambda kv: _method_rank_key_from_metrics(kv[1]["metrics"])
+    )
+    
+    # Add both variants as candidates for potential reporting
+    for affine_name_cand, affine_cand_data in affine_results.items():
+        if affine_name_cand != best_affine_name:
+            affine_candidates.append({
+                "metrics": affine_cand_data["metrics"],
+                "transform": {
+                    **affine_cand_data["transform"],
+                    "candidate_protocol": "affine_after_translation",
+                    "affine_use_clahe": affine_name_cand == "affine_clahe_true",
+                }
+            })
+    
+    methods["affine_after_translation"] = best_affine_data
+
+    # Stage C: nonrigid search - use best of (translation, affine_clahe_false, affine_clahe_true)
     nonrigid_candidates: list[dict[str, Any]] = []
-    init_stack_full_aff = methods["affine_after_translation"]["registered_zstack"]
-    init_stack_crop_aff = init_stack_full_aff[:, yind[:, None], xind]
-    init_mean_crop_aff = init_stack_crop_aff.mean(axis=0)
+    
+    # Determine best base for nonrigid: compare translation vs both affine variants
+    candidates_for_nonrigid = {
+        "translation": methods["translation"],
+    }
+    candidates_for_nonrigid.update(affine_results)
+    
+    best_base = min(
+        candidates_for_nonrigid.items(),
+        key=lambda kv: _method_rank_key_from_metrics(kv[1]["metrics"]),
+    )
+    best_base_name_raw, best_base_data = best_base
+    best_base_name = "affine" if str(best_base_name_raw).startswith("affine_") else "translation"
+    
+    init_stack_full = best_base_data["registered_zstack"]
+    init_stack_crop = init_stack_full[:, yind[:, None], xind]
+    init_mean_crop = init_stack_crop.mean(axis=0)
 
     nr2_search = _search_best_nonrigid(
-        init_stack_crop=init_stack_crop_aff,
-        init_mean_crop=init_mean_crop_aff,
+        init_stack_crop=init_stack_crop,
+        init_mean_crop=init_mean_crop,
         mean_img_cropped=mean_img_cropped,
-        valid_mask=methods["affine_after_translation"]["valid_mask"],
+        valid_mask=best_base_data["valid_mask"],
         block_sizes=nonrigid_block_sizes,
         maxregshift_values=nonrigid_maxregshift_values,
     )
 
     if nr2_search is None:
         methods["nonrigid_after_affine"] = {
-            "registered_zstack": init_stack_full_aff,
-            "registered_mean_cropped": init_mean_crop_aff,
-            "valid_mask": methods["affine_after_translation"]["valid_mask"],
-            "metrics": methods["affine_after_translation"]["metrics"],
+            "registered_zstack": init_stack_full,
+            "registered_mean_cropped": init_mean_crop,
+            "valid_mask": best_base_data["valid_mask"],
+            "metrics": best_base_data["metrics"],
             "transform": {
                 "failed": True,
                 "fallback_to_affine": True,
@@ -444,6 +520,7 @@ def register_local_zstack_to_fov(
                 "candidate_block_sizes": [tuple(x) for x in nonrigid_block_sizes],
                 "candidate_maxregshift_values": list(nonrigid_maxregshift_values),
                 "nonrigid_protocol": "after_affine",
+                "nonrigid_init_from": best_base_name,
             },
         }
     else:
@@ -453,28 +530,29 @@ def register_local_zstack_to_fov(
             tr["candidate_protocol"] = "nonrigid_after_affine"
             nonrigid_candidates.append({"metrics": cand["metrics"], "transform": tr})
 
-        reg_nr2 = init_stack_full_aff.copy().astype(np.float32)
+        reg_nr2 = init_stack_full.copy().astype(np.float32)
         reg_nr2[:, yind[:, None], xind] = best_nr2["registered_crop"]
         metrics_nr2 = best_nr2["metrics"]
         valid_mask_nr2 = np.asarray(
-            best_nr2.get("valid_mask", methods["affine_after_translation"]["valid_mask"]), dtype=bool
+            best_nr2.get("valid_mask", best_base_data["valid_mask"]), dtype=bool
         )
 
         ok_vs_affine = _nonrigid_not_worse_than_translation(
             metrics_nr=metrics_nr2,
-            metrics_t=methods["affine_after_translation"]["metrics"],
+            metrics_t=best_base_data["metrics"],
         )
         if not ok_vs_affine:
             methods["nonrigid_after_affine"] = {
-                "registered_zstack": init_stack_full_aff,
-                "registered_mean_cropped": init_mean_crop_aff,
-                "valid_mask": methods["affine_after_translation"]["valid_mask"],
-                "metrics": methods["affine_after_translation"]["metrics"],
+                "registered_zstack": init_stack_full,
+                "registered_mean_cropped": init_mean_crop,
+                "valid_mask": best_base_data["valid_mask"],
+                "metrics": best_base_data["metrics"],
                 "transform": {
                     **best_nr2["transform"],
                     "fallback_to_affine": True,
-                    "reason": "Best nonrigid-after-affine candidate worse than affine",
+                    "reason": "Best nonrigid-after-affine candidate worse than base",
                     "nonrigid_protocol": "after_affine",
+                    "nonrigid_init_from": best_base_name,
                 },
             }
         else:
@@ -487,6 +565,7 @@ def register_local_zstack_to_fov(
                     **best_nr2["transform"],
                     "fallback_to_affine": False,
                     "nonrigid_protocol": "after_affine",
+                    "nonrigid_init_from": best_base_name,
                 },
             }
 
@@ -723,9 +802,7 @@ def run_single_plane(
     *,
     reg_ref_ind: int = 0,
     save_tiff: bool = True,
-    tiff_save_dir: Path | str | None = None,
     file_suffix: str = "local_zstack_to_fov",
-    affine_use_clahe: bool = False,
     nonrigid_block_sizes: tuple[tuple[int, int], ...] = ((32, 32), (64, 64), (128, 128)),
     nonrigid_maxregshift_values: tuple[int, ...] = (3, 5),
     pad: int = 3,
@@ -741,8 +818,7 @@ def run_single_plane(
         plane_path=plane_path,
         reg_ref_ind=reg_ref_ind,
         save_tiff=save_tiff,
-        tiff_save_dir=tiff_save_dir,
-        affine_use_clahe=affine_use_clahe,
+        output_dir=output_dir,
         nonrigid_block_sizes=nonrigid_block_sizes,
         nonrigid_maxregshift_values=nonrigid_maxregshift_values,
         pad=pad,

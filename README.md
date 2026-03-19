@@ -47,16 +47,15 @@ import register_fov_local_zstack_qc as qc_mod
 import register_fov_local_zstack_viz as viz_mod
 
 plane_path = Path('/root/capsule/data/<processed_session>/<plane_id>')
-out_dir = Path('/root/capsule/scratch/_run/results')
-qc_dir = Path('/root/capsule/scratch/_run/qc')
+out_dir = Path('/root/capsule/results')
+qc_dir = out_dir / 'qc'
 
 # End-to-end registration + save
-run_out = reg_mod.run_(
+run_out = reg_mod.run_single_plane(
     plane_path=plane_path,
     output_dir=out_dir,
     reg_ref_ind=0,
     save_tiff=True,
-    tiff_save_dir=out_dir / 'zstack_tiff',  # use writable dir
     file_suffix='local_zstack_to_fov',
     pad=3,
 )
@@ -76,6 +75,28 @@ qc_out = qc_mod.run_qc(result, qc_dir)
 print(saved_paths)
 print(qc_out['overlay_image_path'])
 print(qc_out['gif_path'])
+```
+
+## Parallel processing
+- Not much of a gain for now (8 planes, 8 workers, with 16 cores)
+- Serial processing takes about 8 minutes
+```python
+from pathlib import Path
+import register_fov_local_zstack_parallel as par_mod
+
+plane_paths = [
+    Path("/root/capsule/data/session/plane_0"),
+    Path("/root/capsule/data/session/plane_1"),
+    # ... up to plane_7
+]
+
+results = par_mod.run_planes_parallel(
+    plane_paths,
+    output_dir=Path("/root/capsule/results"),
+    n_workers=8,
+)
+
+par_mod.print_parallel_results(results)
 ```
 
 ## Core APIs
@@ -133,7 +154,7 @@ Color convention in ROI overlay image:
 
 A runnable test notebook is provided at:
 
-- `notebooks/260318__pipeline_test.ipynb`
+- `test_notebook.ipynb`
 
 It covers:
 - preprocessing

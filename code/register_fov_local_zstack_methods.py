@@ -457,7 +457,6 @@ def _register_affine_with_preprocess(
         "affine_det2x2": float(np.linalg.det(tmat[:2, :2])),
         "affine_tx": float(tmat[0, 2]),
         "affine_ty": float(tmat[1, 2]),
-        "affine_normalize": bool(normalize),
         "affine_use_clahe": bool(use_clahe),
         "updated_valid_mask": updated_valid_mask,
     }
@@ -553,7 +552,6 @@ def _register_nonrigid_suite2p(
         "nr_block_size": tuple(block_size_eff),
         "nr_shift_max_abs": float(max(torch.max(torch.abs(ymax1)), torch.max(torch.abs(xmax1))).item()),
         "nr_use_clahe": bool(use_clahe),
-        "nr_normalize": bool(normalize),
         "nr_ymax1": ymax1.cpu().numpy(),
         "nr_xmax1": xmax1.cpu().numpy(),
         "nr_yblock": np.array(yblock),
@@ -635,9 +633,7 @@ def _search_best_nonrigid(
         maxregshift_values = [3]
 
     preprocess_opts = [
-        {"normalize": False, "use_clahe": False},
         {"normalize": True, "use_clahe": False},
-        {"normalize": False, "use_clahe": True},
         {"normalize": True, "use_clahe": True},
     ]
 
@@ -665,17 +661,8 @@ def _search_best_nonrigid(
                     nr_info.update(
                         {
                             "candidate_block_size": tuple(bs),
-                            "candidate_normalize": bool(pp["normalize"]),
                             "candidate_use_clahe": bool(pp["use_clahe"]),
-                            "candidate_preprocess_mode": (
-                                "norm_clahe"
-                                if (pp["normalize"] and pp["use_clahe"])
-                                else "normalize"
-                                if pp["normalize"]
-                                else "clahe"
-                                if pp["use_clahe"]
-                                else "none"
-                            ),
+                            "candidate_preprocess_mode": "clahe" if pp["use_clahe"] else "none",
                             "candidate_maxregshift_nr": int(maxreg),
                         }
                     )
@@ -726,9 +713,7 @@ def _search_best_affine(
     valid_mask,
 ):
     preprocess_opts = [
-        {"normalize": False, "use_clahe": False},
         {"normalize": True, "use_clahe": False},
-        {"normalize": False, "use_clahe": True},
         {"normalize": True, "use_clahe": True},
     ]
 
@@ -751,17 +736,8 @@ def _search_best_affine(
             a_info = dict(a_info)
             a_info.update(
                 {
-                    "candidate_normalize": bool(pp["normalize"]),
                     "candidate_use_clahe": bool(pp["use_clahe"]),
-                    "candidate_preprocess_mode": (
-                        "norm_clahe"
-                        if (pp["normalize"] and pp["use_clahe"])
-                        else "normalize"
-                        if pp["normalize"]
-                        else "clahe"
-                        if pp["use_clahe"]
-                        else "none"
-                    ),
+                    "candidate_preprocess_mode": "clahe" if pp["use_clahe"] else "none",
                 }
             )
             candidates.append(

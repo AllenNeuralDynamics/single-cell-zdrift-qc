@@ -16,23 +16,21 @@ def _metric_value(metrics: dict[str, Any], key: str) -> float:
 
 
 def _subparam_summary(transform: dict[str, Any]) -> str:
-    norm = transform.get(
-        "candidate_normalize",
-        transform.get("nr_normalize", transform.get("affine_normalize", "n/a")),
-    )
     clahe = transform.get(
         "candidate_use_clahe",
         transform.get("nr_use_clahe", transform.get("affine_use_clahe", "n/a")),
     )
     block = transform.get("candidate_block_size", transform.get("nr_block_size", "n/a"))
     maxreg = transform.get("candidate_maxregshift_nr", transform.get("maxregshift_nr", "n/a"))
-    return (
-        "params:\n"
-        f"  img_norm: {norm}\n"
-        f"  clahe: {clahe}\n"
-        f"  block_size: {block}\n"
-        f"  maxregshift_nr: {maxreg}"
-    )
+    lines = [
+        "params:",
+        f"  clahe: {clahe}",
+        f"  block_size: {block}",
+        f"  maxregshift_nr: {maxreg}",
+    ]
+    if "nonrigid_init_from" in transform:
+        lines.append(f"  nonrigid_base: {transform.get('nonrigid_init_from')}")
+    return "\n".join(lines)
 
 
 def _shared_display_bounds(images: list[np.ndarray]) -> tuple[float, float]:
@@ -464,7 +462,7 @@ def prepare_visualization_result_from_file(
     if not plane_path_str:
         raise KeyError(f"Cannot re-prepare: no plane_path in result file: {result_path}")
 
-    mod_name = "register_fov_local_zstack_single_plane"
+    mod_name = "register_fov_local_zstack"
     try:
         reg_mod = importlib.import_module(mod_name)
     except ModuleNotFoundError:
