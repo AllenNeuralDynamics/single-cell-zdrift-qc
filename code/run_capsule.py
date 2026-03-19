@@ -60,9 +60,9 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='/root/capsule/results', help='Directory to save registration results')
     parser.add_argument('--num_planes', type=int, default=8, help='Number of planes expected in the session')
     parser.add_argument('--intensity_threshold', type=float, default=0.5, help='Intensity threshold for pass/fail single cell drift')
-    parser.add_argument('--zdrift_calc_bin', type=int, default=5, help='Bin size (in frames) for calculating z-drift min/max')
+    parser.add_argument('--zdrift_calc_bin', type=int, default=5, help='Bin size (in minutes) for calculating z-drift min/max')
     parser.add_argument('--parallel', type=int, default=0, help='Whether to run planes in parallel (1) or sequentially (0)')
-    parser.add_argument('--n_workers', type=int, default=8, help='Number of parallel workers to use')
+    parser.add_argument('--n_workers', type=int, default=8, help='Number of parallel workers to use. Only used when parallel=1.')
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)

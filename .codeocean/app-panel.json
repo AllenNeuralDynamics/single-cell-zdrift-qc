@@ -1,0 +1,56 @@
+{
+	"version": 1,
+	"parameters": [
+		{
+			"id": "XTobxjxEhzPAXFJM",
+			"name": "num_planes",
+			"description": "Number of planes in a data asset",
+			"help_text": "Number of planes in a data asset",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "8",
+			"minimum": 1
+		},
+		{
+			"id": "Dm5jTEijRi89F0PI",
+			"name": "intensity_threshold",
+			"description": "Intensity threshold for pass/fail single cell drift",
+			"help_text": "Intensity threshold for pass/fail single cell drift",
+			"type": "text",
+			"value_type": "number",
+			"default_value": "0.5",
+			"minimum": 0,
+			"maximum": 1
+		},
+		{
+			"id": "f1popK0B7rvbnPkY",
+			"name": "zdrift_calc_bin",
+			"description": "Bin size (in minutes) for calculating z-drift min/max",
+			"help_text": "Assumes matched plane indices from movie qc is done per minute",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "5",
+			"minimum": 1
+		},
+		{
+			"id": "fJ7yH9bJJ9zQ85aq",
+			"name": "parallel",
+			"description": "Whether to run planes in parallel (1) or sequentially (0)",
+			"help_text": "Whether to run planes in parallel (1) or sequentially (0)",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "0",
+			"minimum": 0,
+			"maximum": 1
+		},
+		{
+			"id": "hL0BKsFjLnhCv8C9",
+			"name": "n_workers",
+			"description": "Number of parallel workers to use. Only used when parallel=1",
+			"help_text": "Number of parallel workers to use. Only used when parallel=1.",
+			"type": "text",
+			"value_type": "integer",
+			"default_value": "8"
+		}
+	]
+}
