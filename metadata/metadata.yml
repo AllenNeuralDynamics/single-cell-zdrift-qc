@@ -1,16 +1,8 @@
 metadata_version: 1
 name: Single cell z-drift QC
-description: |-
-  Base env setting for using VSCode in CodeOcean
-  - including minimal settings for most of the analysis
-  - setting for opencv
-  - installs comb and lamf-analysis
-  - Manual postInstall setting for VSCode and copilot
-
-  #Updates
-  ## 03/09/2026
-  - CO upgraded to 4.3
-  - No git-askpass required
-  - If copilot does not work, disable and enable the extension
+description: "QC each cell detected in ophys plane for z-drift. \nMeasures ROI intensity
+  change across time-matched planes in local z-stack after registration."
+tags:
+- single-cell-zdrift-qc
 authors:
 - name: Jinho Kim
