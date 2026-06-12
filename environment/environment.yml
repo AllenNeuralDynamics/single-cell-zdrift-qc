@@ -1,7 +1,0 @@
-environment_version: 1
-credentials:
-- type: api-key
-  id: P9gSU8HIiEjvChfR
-  description: CO_API test
-  key: API_KEY
-  secret: API_SECRET

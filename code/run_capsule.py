@@ -71,7 +71,7 @@ if __name__ == '__main__':
     intensity_threshold = args.intensity_threshold
     zdrift_calc_bin = args.zdrift_calc_bin
     input_data = list(input_dir.glob('multiplane-ophys*'))
-    assert len(input_data) == 1, f"Expected exactly one input file, found {len(input_data)}"
+    assert len(input_data) == 1, f"Expected exactly one input file (processed asset), found {len(input_data)}"
     input_folder = input_data[0]
     plane_ids = cdu.get_plane_ids_from_processed_path(input_folder)
     print(f"Found plane IDs: {plane_ids}")
