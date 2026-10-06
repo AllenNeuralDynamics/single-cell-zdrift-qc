@@ -99,7 +99,19 @@ def _mirror_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset())
     Mirroring with real directories and symlinks only at the leaf (file) level
     avoids that entirely, since symlinked *files* match ``rglob`` patterns
     exactly like real ones.
+
+    If ``dst`` itself is already a whole-directory symlink -- e.g. a second
+    plane in the same session being mirrored after
+    ``build_shadow_plane_path``'s own ``_symlink_tree`` pass over "every
+    *other* plane" already symlinked this one whole, back when it was the
+    other plane being skipped -- that symlink is removed first. Otherwise
+    ``dst.mkdir(exist_ok=True)`` is a silent no-op (the symlink already
+    resolves to a directory), every entry below looks like it "already
+    exists" through that symlink, and the caller ends up writing into the
+    original read-only asset.
     """
+    if dst.is_symlink():
+        dst.unlink()
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         if entry.name in skip_names:
