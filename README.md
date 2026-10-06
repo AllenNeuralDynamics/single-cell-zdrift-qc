@@ -169,9 +169,98 @@ It covers:
 - **Read-only filesystem error when saving TIFF**
   - Set `tiff_save_dir` to a writable path (for example under `/root/capsule/scratch/...`).
 - **Missing local z-stack file**
-  - Ensure `plane_path` contains `*_z_stack_local_reg.h5`.
+  - Ensure `plane_path` contains `*_z_stack_local_reg.h5`. Sessions processed
+    before the `movie_qc` pipeline step existed never have this file -- see
+    **Local z-stack processing for missing `movie_qc`** below.
 - **No result files found**
   - Check `output_dir` and filename suffix.
+
+## Local z-stack processing for missing `movie_qc`
+
+Some processed data assets predate the pipeline's `movie_qc` step and are
+missing both `*_z_stack_local_reg.h5` and `movie_qc/*_z_drift_evaluation.json`,
+which `register_fov_local_zstack.prepare_local_zstack`/`prepare_plane_data`
+require. On these assets `run_capsule.py` fails with either:
+
+```
+FileNotFoundError: No '*_z_stack_local_reg.h5' found under .../VISp_0
+```
+
+or, if a `movie_qc/*_z_drift_evaluation.json` exists but its
+`matched_plane_indices` is empty for some other reason:
+
+```
+ValueError: zero-size array to reduction operation minimum which has no identity
+```
+
+`local_zstack_processing.py` rebuilds both missing files from inputs that
+*are* present, using the exact `lamf_analysis` building blocks the production
+pipeline itself uses for this:
+
+1. **`*_z_stack_local_reg.h5`** -- found via
+   `zstack_utils.get_local_zstack_filepath`, which already falls back from the
+   processed asset to the corresponding **raw** asset's `*_z_stack_local.h5`
+   (a raw, interleaved `(n_slices * n_repeats, H, W)` stack), then rebuilt with
+   `zstack.register_local_z_stack`: split into one sub-stack per z-slice
+   (de-interleave), register + average each slice's repeat frames
+   (within-plane), then register the resulting per-slice means to each other
+   (between-plane).
+2. **`movie_qc/*_z_drift_evaluation.json`** (`matched_plane_indices`) -- the
+   same one-minute-mean-FOV-vs-z-stack estimation
+   `capsule_data_utils.get_zdrift_matched_plane_indices(...,
+   run_z_drift_estimation_if_not_found=True)` falls back to, inlined here to
+   reuse the z-stack from step 1 and to stream the (often 50+ GB)
+   decrosstalked movie from disk in ~one-minute chunks rather than loading it
+   whole.
+
+Rather than editing `register_fov_local_zstack.py`, this builds a writable
+**shadow** copy of the affected plane's session directory under a scratch
+root -- symlinks to every existing file/folder (including the sibling raw
+asset, so `get_raw_path_from_plane_path` and friends keep working), plus a
+*real* `movie_qc/` holding the two rebuilt files -- so the rest of the
+pipeline runs against it completely unmodified.
+
+**Requires the plane's raw data asset to be attached next to its processed
+asset under the same `/data` directory.** `run_capsule.py`'s own input-folder
+check now looks specifically for `_processed_` in the name, so the raw
+sibling being attached alongside it is expected and does not confuse it.
+
+```python
+from pathlib import Path
+import local_zstack_processing as lzp
+
+plane_path = Path('/root/capsule/data/<processed_session>/<plane_id>')
+shadow_root = Path('/root/capsule/scratch/zstack_processing_shadow')
+
+# No-op if plane_path already has *_z_stack_local_reg.h5.
+plane_path = lzp.ensure_plane_path(plane_path, shadow_root)
+
+# Then run the existing pipeline exactly as before, against plane_path.
+```
+
+`run_capsule.py --zstack_processing_root /root/capsule/scratch/zstack_processing_shadow`
+(the default) applies this automatically for every plane in the sequential
+path; pass `--zstack_processing_root ''` to disable it and keep the original
+error behavior. The parallel path (`register_fov_local_zstack_parallel.py` /
+`--parallel 1`) does not go through this yet.
+
+**This rebuilds inputs, not ground truth.** The rebuilt z-drift evaluation is
+marked `"local_zstack_processing_generated": true` in the json so it's
+distinguishable from a real on-rig `movie_qc` run.
+
+### Testing local z-stack processing
+
+Use the `codeocean-data-assets` skill to attach a processed asset missing the
+file, plus its raw counterpart, to this capsule:
+
+```bash
+S=.claude/skills/codeocean-data-assets/scripts/co_data_assets.py
+python $S search --subject <id> --type result --name multiplane-ophys  # find the processed asset id
+python $S attach --asset <processed_asset_id> --asset <raw_asset_id>
+```
+
+Then run `local_zstack_processing.ensure_plane_path` (or `run_capsule.py` with
+the default `--zstack_processing_root`) against the attached plane.
 
 ## Suggested Folder Layout for Runs
 
