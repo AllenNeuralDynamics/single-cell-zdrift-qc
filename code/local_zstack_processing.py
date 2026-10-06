@@ -85,7 +85,10 @@ def _symlink_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset()
             continue
         link = dst / entry.name
         if not link.exists():
-            os.symlink(entry, link, target_is_directory=entry.is_dir())
+            # .resolve(): same reasoning as build_shadow_plane_path's
+            # plane_path normalization -- os.symlink's target is interpreted
+            # relative to link's directory on dereference, not src's.
+            os.symlink(entry.resolve(), link, target_is_directory=entry.is_dir())
 
 
 def _mirror_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset()) -> None:
@@ -153,7 +156,13 @@ def build_shadow_plane_path(plane_path: Path | str, shadow_root: Path | str) -> 
         If the raw asset for this session is not attached next to the processed
         one under the same data directory.
     """
-    plane_path = Path(plane_path)
+    # Absolute, not resolved: os.symlink writes its target argument verbatim,
+    # and a relative one is interpreted relative to the *link's* directory
+    # (under shadow_root) when later dereferenced, not relative to this
+    # process's cwd -- so a relative plane_path here would silently produce
+    # symlinks that point nowhere real. .absolute() (not .resolve()) keeps
+    # any intentional symlinks in the original /data mount intact.
+    plane_path = Path(plane_path).absolute()
     processed_dir = plane_path.parent
     data_root = processed_dir.parent
     session_name = processed_dir.name.split("_processed")[0]
@@ -283,26 +292,46 @@ def populate_movie_qc(shadow_plane_path: Path | str) -> dict[str, Any]:
     movie_qc_dir = shadow_plane_path / "movie_qc"
     movie_qc_dir.mkdir(parents=True, exist_ok=True)
 
-    registered_zstack = _rebuild_registered_zstack(shadow_plane_path)
-
     reg_h5_path = movie_qc_dir / f"{plane_id}_z_stack_local_reg.h5"
-    with h5py.File(reg_h5_path, "w") as f:
-        f.create_dataset(
-            "data", data=registered_zstack, compression="gzip", compression_opts=4
-        )
-
-    matched_plane_indices = _rebuild_matched_plane_indices(shadow_plane_path, registered_zstack)
-    if matched_plane_indices.size == 0:
-        raise RuntimeError(f"Estimated matched_plane_indices is empty for {plane_id}")
-
     evaluation_json_path = movie_qc_dir / f"{plane_id}_z_drift_evaluation.json"
-    evaluation_data = {
-        "matched_plane_indices": matched_plane_indices.tolist(),
-        "local_zstack_processing_generated": True,
-        "processing_note": LOCAL_ZSTACK_PROCESSING_NOTE,
-    }
-    with open(evaluation_json_path, "w") as f:
-        json.dump(evaluation_data, f, indent=2)
+    tmp_reg_h5_path = reg_h5_path.with_suffix(reg_h5_path.suffix + ".tmp")
+    tmp_evaluation_json_path = evaluation_json_path.with_suffix(evaluation_json_path.suffix + ".tmp")
+
+    # Both artifacts are written under temp names and only published (renamed
+    # to their final names) once everything has succeeded, h5 last. Without
+    # this, a failure between the two writes (e.g. matched_plane_indices
+    # estimation raising) leaves a complete *_z_stack_local_reg.h5 on disk
+    # with no evaluation json -- needs_local_zstack_processing only checks
+    # for the h5, so a later retry against the same shadow would see it and
+    # skip rebuilding entirely, permanently "poisoning" this shadow plane
+    # path with an incomplete movie_qc/ that later fails inside
+    # prepare_plane_data instead of here. Publishing the h5 last means its
+    # final name never exists unless the json already does too, so that
+    # check stays a valid completion signal either way.
+    try:
+        registered_zstack = _rebuild_registered_zstack(shadow_plane_path)
+        with h5py.File(tmp_reg_h5_path, "w") as f:
+            f.create_dataset(
+                "data", data=registered_zstack, compression="gzip", compression_opts=4
+            )
+
+        matched_plane_indices = _rebuild_matched_plane_indices(shadow_plane_path, registered_zstack)
+        if matched_plane_indices.size == 0:
+            raise RuntimeError(f"Estimated matched_plane_indices is empty for {plane_id}")
+
+        evaluation_data = {
+            "matched_plane_indices": matched_plane_indices.tolist(),
+            "local_zstack_processing_generated": True,
+            "processing_note": LOCAL_ZSTACK_PROCESSING_NOTE,
+        }
+        with open(tmp_evaluation_json_path, "w") as f:
+            json.dump(evaluation_data, f, indent=2)
+
+        os.replace(tmp_evaluation_json_path, evaluation_json_path)
+        os.replace(tmp_reg_h5_path, reg_h5_path)
+    finally:
+        tmp_reg_h5_path.unlink(missing_ok=True)
+        tmp_evaluation_json_path.unlink(missing_ok=True)
 
     return {
         "z_stack_local_reg_h5": reg_h5_path,
