@@ -533,6 +533,49 @@ def read_provenance(plane_path: Path | str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# A second, unrelated compatibility fix: some plane's extraction file is
+# unprefixed. Lives here (not in register_fov_local_zstack.py / capsule_data_
+# utils.py) purely because this module already has the shadow/symlink
+# machinery to apply it without touching read-only originals -- it has
+# nothing to do with movie_qc or z-stacks.
+# ---------------------------------------------------------------------------
+
+def _ensure_prefixed_extraction_alias(plane_path: Path) -> None:
+    """Add a ``<plane_id>_extraction.h5`` alias if only the bare name exists.
+
+    ``capsule_data_utils.load_projection_image`` looks for
+    ``*_extraction.h5`` (``rglob``, underscore required, not optional) --
+    one session in this cohort has its extraction file saved as plain
+    ``extraction.h5`` instead, a one-off naming quirk from whatever
+    processing run produced that specific asset. Confirmed narrow: checked
+    every plane in this cohort -- only that one session's two planes are
+    affected, and no other file in their tree has the same problem (e.g.
+    ``dff.h5`` is matched by a looser ``*dff.h5`` glob elsewhere, so an
+    unprefixed name there is already fine).
+
+    Only acts on a writable ``plane_path`` (in practice: a shadow already
+    built by ``ensure_plane_path`` for the z-stack fix) -- it does not build
+    one itself, so this does NOT help a plane whose extraction file is
+    unprefixed but whose ``movie_qc`` is otherwise fine (no such plane
+    exists in this cohort; worth knowing if this module is ever reused on a
+    different one).
+    """
+    extraction_dir = plane_path / "extraction"
+    if not extraction_dir.is_dir():
+        return
+    plane_id = plane_path.name
+    if list(extraction_dir.glob(f"{plane_id}_extraction.h5")):
+        return  # already prefixed; nothing to do
+    bare = extraction_dir / "extraction.h5"
+    if not bare.exists():
+        return  # no bare file either -- not this quirk, leave it alone
+    try:
+        _symlink_if_absent(bare.resolve(), extraction_dir / f"{plane_id}_extraction.h5")
+    except OSError:
+        pass  # plane_path isn't writable (not a shadow) -- can't help here
+
+
+# ---------------------------------------------------------------------------
 # One-call entry point
 # ---------------------------------------------------------------------------
 
@@ -541,7 +584,8 @@ def ensure_plane_path(plane_path: Path | str, shadow_root: Path | str) -> Path:
 
     If ``plane_path`` already has a local z-stack registration file, it's
     returned unchanged (no shadow is built). Otherwise a shadow is built and
-    populated, and the shadow path is returned.
+    populated (plus the unrelated extraction-naming fix, see
+    ``_ensure_prefixed_extraction_alias``), and the shadow path is returned.
     """
     plane_path = Path(plane_path)
     if not needs_local_zstack_processing(plane_path):
@@ -550,4 +594,5 @@ def ensure_plane_path(plane_path: Path | str, shadow_root: Path | str) -> Path:
     shadow_plane_path = build_shadow_plane_path(plane_path, shadow_root)
     if needs_local_zstack_processing(shadow_plane_path):
         populate_movie_qc(shadow_plane_path)
+    _ensure_prefixed_extraction_alias(shadow_plane_path)
     return shadow_plane_path
