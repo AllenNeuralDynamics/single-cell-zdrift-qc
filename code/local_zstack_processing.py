@@ -224,18 +224,73 @@ def build_shadow_plane_path(plane_path: Path | str, shadow_root: Path | str) -> 
 # Rebuilding the two missing artifacts
 # ---------------------------------------------------------------------------
 
+# Keyed by raw tif path -> (registered_list_or_array, channels_saved), so that
+# two planes sharing one multi-channel raw tif (see _rebuild_registered_zstack)
+# only pay for its registration once. Never evicted, but bounded in practice:
+# one capsule run processes exactly one session's planes, so this holds at
+# most one entry's worth of data (~2 channels) per process lifetime, not one
+# per session ever processed.
+_TIF_ZSTACK_CACHE: dict[str, tuple] = {}
+
+
 def _rebuild_registered_zstack(shadow_plane_path: Path) -> np.ndarray:
     """De-interleave + register the raw local z-stack for this plane.
 
     Finds ``*_z_stack_local.h5`` (processed path first, falling back to the raw
-    asset -- the exact lookup the production pipeline uses) and runs it through
-    ``zstack.register_local_z_stack``, which splits the raw ``(n_slices *
-    n_repeats, H, W)`` stack by slice, registers+averages each slice's repeats
-    (within-plane), then registers the resulting per-slice means to each other
-    (between-plane).
+    asset -- the exact lookup the production pipeline uses) via
+    ``zstack_utils.get_local_zstack_filepath``, which can return either of two
+    formats depending on rig/pipeline vintage:
+
+    - ``.h5``: one file per plane, raw frames only (mesoscope-style). Handled by
+      ``zstack.register_local_z_stack``, which splits the raw ``(n_slices *
+      n_repeats, H, W)`` stack by slice, registers+averages each slice's
+      repeats (within-plane), then registers the resulting per-slice means to
+      each other (between-plane).
+    - ``.tif``/``.tiff``: one file per *session* (seen on at least one
+      non-mesoscope rig in this cohort), with this plane and its
+      simultaneously-acquired sibling multiplexed as separate ScanImage
+      "channels" rather than as separate files. Handled by
+      ``zstack.register_local_zstack_from_raw_tif``, which does the same
+      per-slice within/between-plane registration but returns one stack per
+      channel (a bare array if there's only one channel, else a list). The
+      plane to pick is ``channels_saved[i]`` where ``i`` is this plane's
+      position among the session's imaging planes -- which is exactly the
+      plane id's own trailing index (``VISp_0`` -> 0, ``VISp_1`` -> 1, ...):
+      that index *is* ``fov['index']`` from ``session.json``'s ``ophys_fovs``
+      (see ``capsule_data_utils.get_intended_depth``'s
+      ``plane_names_in_metadata``), and ``ophys_fovs`` and ``channels_saved``
+      are both ordered by acquisition/channel order, so the two indices
+      coincide. Confirmed against session.json depths + channel count for the
+      one session in this cohort that hit this path (759732_2024-12-12:
+      fov 0 = 175 um = VISp_0, fov 1 = 275 um = VISp_1, channels_saved=[1, 2]).
+
+    In the ``.tif`` case, the registration itself (the expensive part --
+    within-plane repeat-registration for every slice of every channel) runs
+    once for *all* of this session's planes at once, since they share one
+    file; a session-scoped cache (``_TIF_ZSTACK_CACHE``) means the second
+    plane's call reuses that result instead of silently repeating the whole
+    thing just to throw away the other channel again.
     """
     local_zstack_path = zstack_utils.get_local_zstack_filepath(shadow_plane_path)
-    registered = zstack_mod.register_local_z_stack(local_zstack_path)
+    suffix = local_zstack_path.suffix.lower()
+    if suffix in (".tif", ".tiff"):
+        cache_key = str(local_zstack_path)
+        cached = _TIF_ZSTACK_CACHE.get(cache_key)
+        if cached is not None:
+            registered, channels_saved = cached
+        else:
+            registered, channels_saved = zstack_mod.register_local_zstack_from_raw_tif(local_zstack_path)
+            _TIF_ZSTACK_CACHE[cache_key] = (registered, channels_saved)
+        if isinstance(registered, list):
+            plane_index = int(shadow_plane_path.name.rsplit("_", 1)[-1])
+            if plane_index >= len(registered):
+                raise ValueError(
+                    f"Raw z-stack tif at {local_zstack_path} has {len(registered)} channel(s) "
+                    f"({channels_saved}), but plane {shadow_plane_path.name} needs index {plane_index}"
+                )
+            registered = registered[plane_index]
+    else:
+        registered = zstack_mod.register_local_z_stack(local_zstack_path)
     return np.asarray(registered, dtype=np.float64)
 
 
