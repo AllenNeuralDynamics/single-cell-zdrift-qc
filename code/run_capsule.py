@@ -1,4 +1,6 @@
 import argparse
+import json
+import shutil
 from pathlib import Path
 import datetime
 
@@ -63,6 +65,29 @@ def run_plane(plane_path, out_dir, intensity_threshold=0.5, zdrift_calc_bin=5, z
     print(qc_out['overlay_image_path'])
     print(qc_out['gif_path'])
 
+    # register_fov_local_zstack.prepare_plane_data only ever reads
+    # matched_plane_indices out of movie_qc/*_z_drift_evaluation.json, so a
+    # generated-vs-genuine flag left only in that scratch-shadow file would
+    # otherwise never reach the published result. Fold it into both: the
+    # metadata.json save_result already wrote (machine-readable without
+    # knowing to look for a second file), and a copy of the evaluation json
+    # itself (full detail, including the note).
+    provenance = lzp_mod.read_provenance(plane_path)
+    if provenance is not None:
+        source_evaluation_json = Path(provenance.pop('source_evaluation_json'))
+
+        metadata_path = saved_paths['metadata_path']
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        metadata.update(provenance)  # local_zstack_processing_generated, processing_note
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        shutil.copy2(source_evaluation_json, qc_dir / source_evaluation_json.name)
+        print(f"local z-stack processing generated this plane's movie_qc -- flagged in {metadata_path}")
+
+    return provenance is not None
+
 if __name__ == '__main__':
     start_date_time = datetime.datetime.now()
 
@@ -102,23 +127,34 @@ if __name__ == '__main__':
     plane_paths = [input_folder / plane_id for plane_id in plane_ids]
 
     # if using parallel (but it is not much faster, likely due to IO bottleneck)
+    locally_processed_planes = []
     if args.parallel:
+        # local z-stack processing is not wired into the parallel path yet.
         results = par_mod.run_planes_parallel(
             plane_paths,
             output_dir=output_dir,
             n_workers=args.n_workers,
         )
-
         par_mod.print_parallel_results(results)
     else:
         for plane_path in plane_paths:
-            run_plane(plane_path,
+            was_generated = run_plane(plane_path,
                       output_dir,
                       intensity_threshold=intensity_threshold,
                       zdrift_calc_bin=zdrift_calc_bin,
                       zstack_processing_root=zstack_processing_root)
+            if was_generated:
+                locally_processed_planes.append(plane_path.name)
 
-    run_parameters = {}
+    # Session-level record of which planes (if any) got their movie_qc from
+    # local z-stack processing rather than genuine on-rig output -- same
+    # provenance gap as the per-plane metadata.json (see run_plane): without
+    # this, the published processing.json for the whole session can't tell
+    # either.
+    run_parameters = (
+        {'local_zstack_processing_generated_planes': locally_processed_planes}
+        if locally_processed_planes else {}
+    )
     source_asset_name = input_folder.name.split('_processed_')[0]
     capture_name = source_asset_name
 

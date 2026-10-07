@@ -239,6 +239,80 @@ def _rebuild_registered_zstack(shadow_plane_path: Path) -> np.ndarray:
     return np.asarray(registered, dtype=np.float64)
 
 
+def _minute_dividers(num_frames: int, frame_rate: float, threshold_sec: float = 30) -> np.ndarray:
+    """Pure copy of ``zdrift.get_one_minute_mean_fovs``'s divider logic.
+
+    Split out so it can run on a bare frame count -- no array, no disk access
+    -- both for the streaming chunker below and for ``_check_divider_parity``.
+    """
+    if frame_rate <= 0:
+        raise ValueError(f"frame_rate must be > 0, got {frame_rate}")
+
+    one_minute_frames = max(1, int(round(frame_rate * 60)))
+    last_minute_threshold = frame_rate * threshold_sec
+    dividers = np.arange(0, num_frames, one_minute_frames, dtype=int)
+
+    if dividers.size == 0:
+        dividers = np.array([0], dtype=int)
+    if dividers[-1] != num_frames:
+        trailing_frames = num_frames - dividers[-1]
+        if trailing_frames < last_minute_threshold and dividers.size > 1:
+            dividers[-1] = num_frames
+        else:
+            dividers = np.append(dividers, num_frames)
+    elif dividers.size == 1:
+        dividers = np.append(dividers, num_frames)
+    return dividers
+
+
+_DIVIDER_PARITY_CHECKED = False
+
+
+def _check_divider_parity() -> None:
+    """Confirm ``_minute_dividers`` still matches the installed
+    ``lamf_analysis.ophys.zdrift.get_one_minute_mean_fovs`` it was copied from.
+
+    ``environment/postInstall`` clones ``lamf-analysis`` from its default
+    branch with no pinned ref, so the installed copy can change under a
+    capsule rebuild with no signal here otherwise -- this module would then
+    silently chunk the movie differently than the function it claims to be
+    equivalent to, producing different (wrong) ``matched_plane_indices`` with
+    no error. Checked once per process, against tiny (1-pixel) synthetic
+    movies spanning the edge cases in the divider logic above, comparing only
+    the resulting *chunk count* -- cheap enough to run every time rather than
+    trust a one-off manual check to stay valid.
+    """
+    global _DIVIDER_PARITY_CHECKED
+    if _DIVIDER_PARITY_CHECKED:
+        return
+
+    frame_rate = 10.0
+    one_minute_frames = int(round(frame_rate * 60))
+    cases = [
+        one_minute_frames,  # exact multiple
+        one_minute_frames * 3,
+        one_minute_frames * 3 + 1,  # tiny trailing remainder (below threshold)
+        one_minute_frames * 3 + int(frame_rate * 30) + 5,  # trailing remainder above threshold
+        1,  # degenerate
+    ]
+    for num_frames in cases:
+        expected = len(zdrift_mod.get_one_minute_mean_fovs(
+            np.zeros((num_frames, 1, 1), dtype=np.float32), frame_rate
+        ))
+        actual = len(_minute_dividers(num_frames, frame_rate)) - 1
+        if actual != expected:
+            raise RuntimeError(
+                "local_zstack_processing._minute_dividers has drifted from the installed "
+                "lamf_analysis.ophys.zdrift.get_one_minute_mean_fovs "
+                f"(num_frames={num_frames}, frame_rate={frame_rate}: "
+                f"got {actual} chunks, upstream gives {expected}). "
+                "lamf-analysis is cloned unpinned in environment/postInstall, so this can "
+                "happen after any rebuild -- re-sync _minute_dividers with the current "
+                "upstream implementation before trusting matched_plane_indices from this module."
+            )
+    _DIVIDER_PARITY_CHECKED = True
+
+
 def _one_minute_mean_fovs_streaming(
     movie_path: Path, frame_rate: float, threshold_sec: float = 30
 ) -> np.ndarray:
@@ -246,34 +320,26 @@ def _one_minute_mean_fovs_streaming(
     the whole movie into memory -- full-session decrosstalked movies here run
     ~100k+ frames at (512, 512) int16, i.e. tens of GB, which does not fit.
 
-    Reproduces that function's divider logic exactly (including its
-    ``frame_rate > 0`` validation -- with a zero/invalid frame rate,
-    ``one_minute_frames`` would silently floor to 1, making ``emf`` roughly
-    ``num_frames`` long instead of ~60x shorter: a multi-hundred-GB
+    Reproduces that function's divider logic exactly (see ``_minute_dividers``,
+    including the ``frame_rate > 0`` validation -- with a zero/invalid frame
+    rate, ``one_minute_frames`` would silently floor to 1, making ``emf``
+    roughly ``num_frames`` long instead of ~60x shorter: a multi-hundred-GB
     allocation attempt instead of a clear error), but reads and averages one
-    ~one-minute chunk directly from the HDF5 dataset at a time.
+    ~one-minute chunk directly from the HDF5 dataset at a time. Verifies that
+    reproduction is still accurate (``_check_divider_parity``) before relying
+    on it.
     """
     if frame_rate <= 0:
+        # Fail before opening movie_path, not after: _minute_dividers below
+        # checks this too, but only once num_frames is already in hand, which
+        # needs the (potentially huge, slow-to-open-over-S3) file open first.
         raise ValueError(f"frame_rate must be > 0, got {frame_rate}")
+    _check_divider_parity()
 
     with h5py.File(movie_path, "r") as f:
         dset = f["data"]
         num_frames, ny, nx = dset.shape
-
-        one_minute_frames = max(1, int(round(frame_rate * 60)))
-        last_minute_threshold = frame_rate * threshold_sec
-        dividers = np.arange(0, num_frames, one_minute_frames, dtype=int)
-
-        if dividers.size == 0:
-            dividers = np.array([0], dtype=int)
-        if dividers[-1] != num_frames:
-            trailing_frames = num_frames - dividers[-1]
-            if trailing_frames < last_minute_threshold and dividers.size > 1:
-                dividers[-1] = num_frames
-            else:
-                dividers = np.append(dividers, num_frames)
-        elif dividers.size == 1:
-            dividers = np.append(dividers, num_frames)
+        dividers = _minute_dividers(num_frames, frame_rate, threshold_sec)
 
         emf = np.zeros((len(dividers) - 1, ny, nx), dtype=np.float32)
         for i in range(len(dividers) - 1):
@@ -375,6 +441,39 @@ def populate_movie_qc(shadow_plane_path: Path | str) -> dict[str, Any]:
         "z_stack_local_reg_h5": reg_h5_path,
         "z_drift_evaluation_json": evaluation_json_path,
         "matched_plane_indices": matched_plane_indices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Provenance: letting callers (and published results) tell generated apart
+# from genuine on-rig movie_qc
+# ---------------------------------------------------------------------------
+
+def read_provenance(plane_path: Path | str) -> dict[str, Any] | None:
+    """Return this module's provenance record for ``plane_path``, or ``None``.
+
+    ``register_fov_local_zstack.prepare_plane_data`` only ever extracts
+    ``matched_plane_indices`` out of ``movie_qc/*_z_drift_evaluation.json`` --
+    the ``local_zstack_processing_generated``/``processing_note`` fields
+    ``populate_movie_qc`` writes alongside it are otherwise never looked at
+    again, including by the final published result/processing metadata. This
+    is how a caller (see ``run_capsule.py``) recovers that record itself, to
+    fold it into the output it does control, so a generated estimate stays
+    distinguishable from genuine on-rig ``movie_qc`` after publication rather
+    than silently looking identical to it.
+    """
+    plane_path = Path(plane_path)
+    evaluation_path = next(plane_path.rglob("*_z_drift_evaluation.json"), None)
+    if evaluation_path is None:
+        return None
+    with open(evaluation_path) as f:
+        evaluation_data = json.load(f)
+    if not evaluation_data.get("local_zstack_processing_generated"):
+        return None
+    return {
+        "local_zstack_processing_generated": True,
+        "processing_note": evaluation_data.get("processing_note"),
+        "source_evaluation_json": str(evaluation_path),
     }
 
 

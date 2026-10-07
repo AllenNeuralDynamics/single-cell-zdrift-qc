@@ -13,6 +13,10 @@ It uses local z-stack - Register the z-stack to FOV, match each ROI in FOV to z-
   - Result loading and method-comparison visualization
 - `register_fov_local_zstack_qc.py`
   - QC metrics, ROI/neuropil overlays, and GIF generation
+- `local_zstack_processing.py`
+  - Rebuilds `*_z_stack_local_reg.h5` / `movie_qc/*_z_drift_evaluation.json` for
+    processed assets that predate the `movie_qc` pipeline step -- see
+    "Local z-stack processing for missing `movie_qc`" below
 
 ## What This Workflow Does
 
@@ -188,24 +192,7 @@ FileNotFoundError: No '*_z_stack_local_reg.h5' found under .../VISp_0
 
 `local_zstack_processing.py` rebuilds both missing files from inputs that
 *are* present, using the exact `lamf_analysis` building blocks the production
-pipeline itself uses for this. It's keyed entirely on whether
-`*_z_stack_local_reg.h5` exists
-(`needs_local_zstack_processing`/`ensure_plane_path`), so it only ever acts on
-the `FileNotFoundError` case above.
-
-**A separate, unsupported failure mode:** a plane whose `*_z_stack_local_reg.h5`
-*is* present but whose `movie_qc/*_z_drift_evaluation.json` has an empty
-`matched_plane_indices` for some other reason (seen in practice on one session
-during this investigation) hits
-
-```
-ValueError: zero-size array to reduction operation minimum which has no identity
-```
-
-in `prepare_plane_data` further down the same pipeline. `ensure_plane_path`
-returns such a plane's path unchanged -- its `*_z_stack_local_reg.h5` already
-exists, so nothing here is triggered -- and it reaches that `ValueError`
-exactly as before. This module does not repair that case.
+pipeline itself uses for this:
 
 1. **`*_z_stack_local_reg.h5`** -- found via
    `zstack_utils.get_local_zstack_filepath`, which already falls back from the
@@ -222,6 +209,24 @@ exactly as before. This module does not repair that case.
    reuse the z-stack from step 1 and to stream the (often 50+ GB)
    decrosstalked movie from disk in ~one-minute chunks rather than loading it
    whole.
+
+It's keyed entirely on whether `*_z_stack_local_reg.h5` exists
+(`needs_local_zstack_processing`/`ensure_plane_path`), so it only ever acts on
+the `FileNotFoundError` case above.
+
+**A separate, unsupported failure mode:** a plane whose `*_z_stack_local_reg.h5`
+*is* present but whose `movie_qc/*_z_drift_evaluation.json` has an empty
+`matched_plane_indices` for some other reason (seen in practice on one session
+during this investigation) hits
+
+```
+ValueError: zero-size array to reduction operation minimum which has no identity
+```
+
+in `prepare_plane_data` further down the same pipeline. `ensure_plane_path`
+returns such a plane's path unchanged -- its `*_z_stack_local_reg.h5` already
+exists, so nothing here is triggered -- and it reaches that `ValueError`
+exactly as before. This module does not repair that case.
 
 Rather than editing `register_fov_local_zstack.py`, this builds a writable
 **shadow** copy of the affected plane's session directory under a scratch
@@ -256,18 +261,54 @@ error behavior. The parallel path (`register_fov_local_zstack_parallel.py` /
 
 **This rebuilds inputs, not ground truth.** The rebuilt z-drift evaluation is
 marked `"local_zstack_processing_generated": true` in the json so it's
-distinguishable from a real on-rig `movie_qc` run.
+distinguishable from a real on-rig `movie_qc` run. Since
+`register_fov_local_zstack.prepare_plane_data` only ever extracts
+`matched_plane_indices` out of that json, this flag would otherwise never
+reach the published result -- `run_capsule.py` reads it back
+(`local_zstack_processing.read_provenance`) and folds it into the plane's
+`metadata.json` and a copy of the evaluation json in its `qc/` output, plus a
+session-level `local_zstack_processing_generated_planes` list in the
+published `processing.json` if any plane in the session needed it.
 
 ### Testing local z-stack processing
 
-Use the `codeocean-data-assets` skill to attach a processed asset missing the
-file, plus its raw counterpart, to this capsule:
+You need a processed asset missing `*_z_stack_local_reg.h5`, plus its raw
+counterpart, both attached to this capsule's `/data`:
 
-```bash
-S=.claude/skills/codeocean-data-assets/scripts/co_data_assets.py
-python $S search --subject <id> --type result --name multiplane-ophys  # find the processed asset id
-python $S attach --asset <processed_asset_id> --asset <raw_asset_id>
-```
+- **Via the Code Ocean UI** (no extra tooling): open this capsule, go to
+  **Data Assets** -> **Attach data assets**, search by subject id for the
+  `..._processed_...` asset and its `multiplane-ophys_<subject>_<date>` raw
+  sibling (no `_processed_` suffix, same subject/date), and attach both.
+  They mount under `/data` immediately, no restart needed.
+- **Via the `codeocean` SDK** (already a pinned dependency of this capsule --
+  see `environment/Dockerfile`), from inside a running computation:
+
+  ```python
+  import os
+  from codeocean import CodeOcean
+  from codeocean.data_asset import DataAssetSearchParams, DataAssetAttachParams
+  from codeocean.components import SearchFilter
+
+  client = CodeOcean(domain="https://codeocean.allenneuraldynamics.org",
+                      token=os.environ["API_SECRET"])  # or CODEOCEAN_TOKEN/CO_TOKEN
+  computation_id = os.environ["CO_COMPUTATION_ID"]  # set inside any running computation
+
+  results = client.data_assets.search_data_assets(DataAssetSearchParams(
+      filters=[SearchFilter(key="tags", value="<subject_id>")],
+      query="multiplane-ophys", limit=100,
+  )).results
+  for a in results:
+      print(a.id, a.name)
+  # Pick the processed asset (name contains "_processed_") and its raw
+  # sibling (same "multiplane-ophys_<subject>_<date>" prefix, no
+  # "_processed_" suffix) from the printed list, then:
+  asset_ids = ["<processed_asset_id>", "<raw_asset_id>"]
+
+  client.computations.attach_data_assets(
+      computation_id=computation_id,
+      attach_params=[DataAssetAttachParams(id=aid) for aid in asset_ids],
+  )
+  ```
 
 Then run `local_zstack_processing.ensure_plane_path` (or `run_capsule.py` with
 the default `--zstack_processing_root`) against the attached plane.
