@@ -13,6 +13,10 @@ It uses local z-stack - Register the z-stack to FOV, match each ROI in FOV to z-
   - Result loading and method-comparison visualization
 - `register_fov_local_zstack_qc.py`
   - QC metrics, ROI/neuropil overlays, and GIF generation
+- `local_zstack_processing.py`
+  - Rebuilds `*_z_stack_local_reg.h5` / `movie_qc/*_z_drift_evaluation.json` for
+    processed assets that predate the `movie_qc` pipeline step -- see
+    "Local z-stack processing for missing `movie_qc`" below
 
 ## What This Workflow Does
 
@@ -169,9 +173,145 @@ It covers:
 - **Read-only filesystem error when saving TIFF**
   - Set `tiff_save_dir` to a writable path (for example under `/root/capsule/scratch/...`).
 - **Missing local z-stack file**
-  - Ensure `plane_path` contains `*_z_stack_local_reg.h5`.
+  - Ensure `plane_path` contains `*_z_stack_local_reg.h5`. Sessions processed
+    before the `movie_qc` pipeline step existed never have this file -- see
+    **Local z-stack processing for missing `movie_qc`** below.
 - **No result files found**
   - Check `output_dir` and filename suffix.
+
+## Local z-stack processing for missing `movie_qc`
+
+Some processed data assets predate the pipeline's `movie_qc` step and are
+missing both `*_z_stack_local_reg.h5` and `movie_qc/*_z_drift_evaluation.json`,
+which `register_fov_local_zstack.prepare_local_zstack`/`prepare_plane_data`
+require. On these assets `run_capsule.py` fails with:
+
+```
+FileNotFoundError: No '*_z_stack_local_reg.h5' found under .../VISp_0
+```
+
+`local_zstack_processing.py` rebuilds both missing files from inputs that
+*are* present, using the exact `lamf_analysis` building blocks the production
+pipeline itself uses for this:
+
+1. **`*_z_stack_local_reg.h5`** -- found via
+   `zstack_utils.get_local_zstack_filepath`, which already falls back from the
+   processed asset to the corresponding **raw** asset's `*_z_stack_local.h5`
+   (a raw, interleaved `(n_slices * n_repeats, H, W)` stack), then rebuilt with
+   `zstack.register_local_z_stack`: split into one sub-stack per z-slice
+   (de-interleave), register + average each slice's repeat frames
+   (within-plane), then register the resulting per-slice means to each other
+   (between-plane).
+2. **`movie_qc/*_z_drift_evaluation.json`** (`matched_plane_indices`) -- the
+   same one-minute-mean-FOV-vs-z-stack estimation
+   `capsule_data_utils.get_zdrift_matched_plane_indices(...,
+   run_z_drift_estimation_if_not_found=True)` falls back to, inlined here to
+   reuse the z-stack from step 1 and to stream the (often 50+ GB)
+   decrosstalked movie from disk in ~one-minute chunks rather than loading it
+   whole.
+
+It's keyed entirely on whether `*_z_stack_local_reg.h5` exists
+(`needs_local_zstack_processing`/`ensure_plane_path`), so it only ever acts on
+the `FileNotFoundError` case above.
+
+**A separate, unsupported failure mode:** a plane whose `*_z_stack_local_reg.h5`
+*is* present but whose `movie_qc/*_z_drift_evaluation.json` has an empty
+`matched_plane_indices` for some other reason (seen in practice on one session
+during this investigation) hits
+
+```
+ValueError: zero-size array to reduction operation minimum which has no identity
+```
+
+in `prepare_plane_data` further down the same pipeline. `ensure_plane_path`
+returns such a plane's path unchanged -- its `*_z_stack_local_reg.h5` already
+exists, so nothing here is triggered -- and it reaches that `ValueError`
+exactly as before. This module does not repair that case.
+
+Rather than editing `register_fov_local_zstack.py`, this builds a writable
+**shadow** copy of the affected plane's session directory under a scratch
+root -- symlinks to every existing file/folder (including the sibling raw
+asset, so `get_raw_path_from_plane_path` and friends keep working), plus a
+*real* `movie_qc/` holding the two rebuilt files -- so the rest of the
+pipeline runs against it completely unmodified.
+
+**Requires the plane's raw data asset to be attached next to its processed
+asset under the same `/data` directory.** `run_capsule.py`'s own input-folder
+check now looks specifically for `_processed_` in the name, so the raw
+sibling being attached alongside it is expected and does not confuse it.
+
+```python
+from pathlib import Path
+import local_zstack_processing as lzp
+
+plane_path = Path('/root/capsule/data/<processed_session>/<plane_id>')
+shadow_root = Path('/root/capsule/scratch/zstack_processing_shadow')
+
+# No-op if plane_path already has *_z_stack_local_reg.h5.
+plane_path = lzp.ensure_plane_path(plane_path, shadow_root)
+
+# Then run the existing pipeline exactly as before, against plane_path.
+```
+
+`run_capsule.py --zstack_processing_root /root/capsule/scratch/zstack_processing_shadow`
+(the default) applies this automatically for every plane in the sequential
+path; pass `--zstack_processing_root ''` to disable it and keep the original
+error behavior. The parallel path (`register_fov_local_zstack_parallel.py` /
+`--parallel 1`) does not go through this yet.
+
+**This rebuilds inputs, not ground truth.** The rebuilt z-drift evaluation is
+marked `"local_zstack_processing_generated": true` in the json so it's
+distinguishable from a real on-rig `movie_qc` run. Since
+`register_fov_local_zstack.prepare_plane_data` only ever extracts
+`matched_plane_indices` out of that json, this flag would otherwise never
+reach the published result -- `run_capsule.py` reads it back
+(`local_zstack_processing.read_provenance`) and folds it into the plane's
+`metadata.json` and a copy of the evaluation json in its `qc/` output, plus a
+session-level `local_zstack_processing_generated_planes` list in the
+published `processing.json` if any plane in the session needed it.
+
+### Testing local z-stack processing
+
+You need a processed asset missing `*_z_stack_local_reg.h5`, plus its raw
+counterpart, both attached to this capsule's `/data`:
+
+- **Via the Code Ocean UI** (no extra tooling): open this capsule, go to
+  **Data Assets** -> **Attach data assets**, search by subject id for the
+  `..._processed_...` asset and its `multiplane-ophys_<subject>_<date>` raw
+  sibling (no `_processed_` suffix, same subject/date), and attach both.
+  They mount under `/data` immediately, no restart needed.
+- **Via the `codeocean` SDK** (already a pinned dependency of this capsule --
+  see `environment/Dockerfile`), from inside a running computation:
+
+  ```python
+  import os
+  from codeocean import CodeOcean
+  from codeocean.data_asset import DataAssetSearchParams, DataAssetAttachParams
+  from codeocean.components import SearchFilter
+
+  client = CodeOcean(domain="https://codeocean.allenneuraldynamics.org",
+                      token=os.environ["API_SECRET"])  # or CODEOCEAN_TOKEN/CO_TOKEN
+  computation_id = os.environ["CO_COMPUTATION_ID"]  # set inside any running computation
+
+  results = client.data_assets.search_data_assets(DataAssetSearchParams(
+      filters=[SearchFilter(key="tags", value="<subject_id>")],
+      query="multiplane-ophys", limit=100,
+  )).results
+  for a in results:
+      print(a.id, a.name)
+  # Pick the processed asset (name contains "_processed_") and its raw
+  # sibling (same "multiplane-ophys_<subject>_<date>" prefix, no
+  # "_processed_" suffix) from the printed list, then:
+  asset_ids = ["<processed_asset_id>", "<raw_asset_id>"]
+
+  client.computations.attach_data_assets(
+      computation_id=computation_id,
+      attach_params=[DataAssetAttachParams(id=aid) for aid in asset_ids],
+  )
+  ```
+
+Then run `local_zstack_processing.ensure_plane_path` (or `run_capsule.py` with
+the default `--zstack_processing_root`) against the attached plane.
 
 ## Suggested Folder Layout for Runs
 
