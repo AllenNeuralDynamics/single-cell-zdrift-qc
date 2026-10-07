@@ -85,6 +85,8 @@ def _symlink_if_absent(target: Path, link: Path, *, target_is_directory: bool = 
     ignore: by the time it's raised, the link exists either way, which is all
     every caller here checks for.
     """
+    if link.is_symlink() and not link.exists():
+        link.unlink(missing_ok=True)
     if link.exists():
         return
     try:
