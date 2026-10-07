@@ -180,22 +180,32 @@ It covers:
 Some processed data assets predate the pipeline's `movie_qc` step and are
 missing both `*_z_stack_local_reg.h5` and `movie_qc/*_z_drift_evaluation.json`,
 which `register_fov_local_zstack.prepare_local_zstack`/`prepare_plane_data`
-require. On these assets `run_capsule.py` fails with either:
+require. On these assets `run_capsule.py` fails with:
 
 ```
 FileNotFoundError: No '*_z_stack_local_reg.h5' found under .../VISp_0
 ```
 
-or, if a `movie_qc/*_z_drift_evaluation.json` exists but its
-`matched_plane_indices` is empty for some other reason:
+`local_zstack_processing.py` rebuilds both missing files from inputs that
+*are* present, using the exact `lamf_analysis` building blocks the production
+pipeline itself uses for this. It's keyed entirely on whether
+`*_z_stack_local_reg.h5` exists
+(`needs_local_zstack_processing`/`ensure_plane_path`), so it only ever acts on
+the `FileNotFoundError` case above.
+
+**A separate, unsupported failure mode:** a plane whose `*_z_stack_local_reg.h5`
+*is* present but whose `movie_qc/*_z_drift_evaluation.json` has an empty
+`matched_plane_indices` for some other reason (seen in practice on one session
+during this investigation) hits
 
 ```
 ValueError: zero-size array to reduction operation minimum which has no identity
 ```
 
-`local_zstack_processing.py` rebuilds both missing files from inputs that
-*are* present, using the exact `lamf_analysis` building blocks the production
-pipeline itself uses for this:
+in `prepare_plane_data` further down the same pipeline. `ensure_plane_path`
+returns such a plane's path unchanged -- its `*_z_stack_local_reg.h5` already
+exists, so nothing here is triggered -- and it reaches that `ValueError`
+exactly as before. This module does not repair that case.
 
 1. **`*_z_stack_local_reg.h5`** -- found via
    `zstack_utils.get_local_zstack_filepath`, which already falls back from the

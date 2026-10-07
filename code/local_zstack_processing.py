@@ -73,6 +73,26 @@ def needs_local_zstack_processing(plane_path: Path | str) -> bool:
 # Shadow plane directory: symlink farm + the two rebuilt files
 # ---------------------------------------------------------------------------
 
+def _symlink_if_absent(target: Path, link: Path, *, target_is_directory: bool = False) -> None:
+    """``os.symlink(target, link)`` unless ``link`` already exists.
+
+    The existence check and the symlink call are two separate syscalls, so a
+    second plane from the same session being processed concurrently (the
+    sequential path never does this today, but nothing stops a future
+    parallel one) can slip in between them and create ``link`` first --
+    ``os.symlink`` has no atomic "create if absent" mode, only an
+    after-the-fact ``FileExistsError``, which is what's caught here. Safe to
+    ignore: by the time it's raised, the link exists either way, which is all
+    every caller here checks for.
+    """
+    if link.exists():
+        return
+    try:
+        os.symlink(target, link, target_is_directory=target_is_directory)
+    except FileExistsError:
+        pass
+
+
 def _symlink_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset()) -> None:
     """Shallow-symlink every entry of ``src`` into ``dst`` (idempotent).
 
@@ -83,12 +103,10 @@ def _symlink_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset()
     for entry in src.iterdir():
         if entry.name in skip_names:
             continue
-        link = dst / entry.name
-        if not link.exists():
-            # .resolve(): same reasoning as build_shadow_plane_path's
-            # plane_path normalization -- os.symlink's target is interpreted
-            # relative to link's directory on dereference, not src's.
-            os.symlink(entry.resolve(), link, target_is_directory=entry.is_dir())
+        # .resolve(): same reasoning as build_shadow_plane_path's plane_path
+        # normalization -- os.symlink's target is interpreted relative to
+        # link's directory on dereference, not src's.
+        _symlink_if_absent(entry.resolve(), dst / entry.name, target_is_directory=entry.is_dir())
 
 
 def _mirror_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset()) -> None:
@@ -112,6 +130,15 @@ def _mirror_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset())
     resolves to a directory), every entry below looks like it "already
     exists" through that symlink, and the caller ends up writing into the
     original read-only asset.
+
+    Idempotent and retry-safe: a leaf file/symlink that already exists is
+    left alone (a single ``os.symlink`` call is atomic, so an existing one is
+    never partial), but an existing *directory* is always recursed into
+    rather than short-circuited -- a directory can easily be left
+    half-populated by an interrupted previous run (e.g. ``extraction/``
+    created but only some of its files linked in before a crash), and
+    skipping it on sight would make that partial state permanent across
+    every subsequent retry.
     """
     if dst.is_symlink():
         dst.unlink()
@@ -120,12 +147,10 @@ def _mirror_tree(src: Path, dst: Path, skip_names: frozenset[str] = frozenset())
         if entry.name in skip_names:
             continue
         target = dst / entry.name
-        if target.exists():
-            continue
         if entry.is_dir() and not entry.is_symlink():
             _mirror_tree(entry, target)
         else:
-            os.symlink(entry.resolve(), target)
+            _symlink_if_absent(entry.resolve(), target)
 
 
 def build_shadow_plane_path(plane_path: Path | str, shadow_root: Path | str) -> Path:
@@ -180,8 +205,7 @@ def build_shadow_plane_path(plane_path: Path | str, shadow_root: Path | str) -> 
     shadow_plane_path = shadow_processed_dir / plane_path.name
 
     shadow_data_root.mkdir(parents=True, exist_ok=True)
-    if not shadow_raw_dir.exists():
-        os.symlink(raw_dir, shadow_raw_dir, target_is_directory=True)
+    _symlink_if_absent(raw_dir, shadow_raw_dir, target_is_directory=True)
 
     # Other planes in the session are symlinked whole (nothing rglobs into them
     # from the target plane's path). The target plane itself is mirrored with
@@ -220,9 +244,16 @@ def _one_minute_mean_fovs_streaming(
     the whole movie into memory -- full-session decrosstalked movies here run
     ~100k+ frames at (512, 512) int16, i.e. tens of GB, which does not fit.
 
-    Reproduces that function's divider logic exactly, but reads and averages one
+    Reproduces that function's divider logic exactly (including its
+    ``frame_rate > 0`` validation -- with a zero/invalid frame rate,
+    ``one_minute_frames`` would silently floor to 1, making ``emf`` roughly
+    ``num_frames`` long instead of ~60x shorter: a multi-hundred-GB
+    allocation attempt instead of a clear error), but reads and averages one
     ~one-minute chunk directly from the HDF5 dataset at a time.
     """
+    if frame_rate <= 0:
+        raise ValueError(f"frame_rate must be > 0, got {frame_rate}")
+
     with h5py.File(movie_path, "r") as f:
         dset = f["data"]
         num_frames, ny, nx = dset.shape
@@ -294,8 +325,13 @@ def populate_movie_qc(shadow_plane_path: Path | str) -> dict[str, Any]:
 
     reg_h5_path = movie_qc_dir / f"{plane_id}_z_stack_local_reg.h5"
     evaluation_json_path = movie_qc_dir / f"{plane_id}_z_drift_evaluation.json"
-    tmp_reg_h5_path = reg_h5_path.with_suffix(reg_h5_path.suffix + ".tmp")
-    tmp_evaluation_json_path = evaluation_json_path.with_suffix(evaluation_json_path.suffix + ".tmp")
+    # PID-suffixed: two processes racing on the same plane (not possible via
+    # today's sequential-only wiring, but this module makes no such
+    # assumption otherwise) would share a fixed temp name and interleave
+    # writes into it; each gets its own here instead.
+    tmp_tag = f".{os.getpid()}.tmp"
+    tmp_reg_h5_path = reg_h5_path.with_suffix(reg_h5_path.suffix + tmp_tag)
+    tmp_evaluation_json_path = evaluation_json_path.with_suffix(evaluation_json_path.suffix + tmp_tag)
 
     # Both artifacts are written under temp names and only published (renamed
     # to their final names) once everything has succeeded, h5 last. Without
